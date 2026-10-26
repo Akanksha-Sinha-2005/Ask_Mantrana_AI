@@ -366,6 +366,9 @@ export const Composer: React.FC<ComposerProps> = ({
     { id: 'music', label: 'Music', icon: <Music className="w-3.5 h-3.5" /> },
   ];
 
+  const selectedModeOption =
+    modeButtons.find((m) => m.id === mode) || modeButtons[0];
+
   return (
     <div className="w-full max-w-4xl mx-auto px-2.5 sm:px-6 pb-2 sm:pb-3 pt-1.5 sm:pt-2 pb-safe">
       {/* Microphone permission denied banner */}
@@ -675,29 +678,23 @@ export const Composer: React.FC<ComposerProps> = ({
               <span className="hidden md:inline">Attach</span>
             </button>
 
-            <div
-              role="group"
-              aria-label="Generation mode"
-              className="flex items-center gap-0.5 p-0.5 rounded-xl bg-slate-100 dark:bg-slate-800/90"
-            >
-              {modeButtons.map((btn) => {
-                const active = mode === btn.id;
-                return (
-                  <button
-                    key={btn.id}
-                    type="button"
-                    onClick={() => onChangeMode(btn.id)}
-                    className={`inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-xs font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                      active
-                        ? 'bg-white dark:bg-slate-900 text-teal-700 dark:text-teal-400 shadow-2xs'
-                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    {btn.icon}
-                    <span className="text-[11px] sm:text-xs">{btn.label}</span>
-                  </button>
-                );
-              })}
+            <div className="relative flex items-center">
+              <span className="text-teal-600 dark:text-teal-400 absolute left-2 pointer-events-none flex items-center">
+                {selectedModeOption.icon}
+              </span>
+              <select
+                value={selectedModeOption.id}
+                onChange={(e) => onChangeMode(e.target.value as ComposerMode)}
+                aria-label="Generation mode"
+                title={`Generation mode: ${selectedModeOption.label}`}
+                className="pl-6 pr-2 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] sm:text-xs font-medium text-slate-700 dark:text-slate-200 border border-slate-200/80 dark:border-slate-700/80 hover:border-teal-500/60 focus:border-teal-500 focus:outline-none cursor-pointer transition-colors"
+              >
+                {modeButtons.map((btn) => (
+                  <option key={btn.id} value={btn.id}>
+                    {btn.label}
+                  </option>
+                ))}
+              </select>
             </div>
           </div>
 

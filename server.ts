@@ -7,10 +7,43 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Modality, GenerateContentResponse, ThinkingLevel } from '@google/genai';
-import { GEMINI_CONFIGURED_API_KEY, getConfiguredApiKey } from './apiKey.config';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Fault-tolerant loader for the separate git-ignored `apiKey.config.ts` file.
+// Avoids static ESM `ERR_MODULE_NOT_FOUND` on Node.js v22 / Cloud Run when git-ignored files are excluded.
+let dynamicConfiguredKey = '';
+const apiKeyConfigPath = path.join(__dirname, 'apiKey.config.ts');
+if (fs.existsSync(apiKeyConfigPath)) {
+  const configModuleUrl = new URL('./apiKey.config.ts', import.meta.url).href;
+  import(configModuleUrl)
+    .then((mod) => {
+      if (typeof mod?.getConfiguredApiKey === 'function') {
+        dynamicConfiguredKey = String(mod.getConfiguredApiKey() || '').trim();
+      } else if (typeof mod?.GEMINI_CONFIGURED_API_KEY === 'string') {
+        dynamicConfiguredKey = mod.GEMINI_CONFIGURED_API_KEY.trim();
+      }
+    })
+    .catch(() => {
+      // Handled by synchronous file reader fallback below
+    });
+}
+
+function readKeyFromSeparateConfigFile(): string {
+  try {
+    if (fs.existsSync(apiKeyConfigPath)) {
+      const content = fs.readFileSync(apiKeyConfigPath, 'utf8');
+      const match = content.match(/CUSTOM_GEMINI_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/);
+      if (match && match[1] && match[1].trim()) {
+        return match[1].trim();
+      }
+    }
+  } catch {
+    // Ignore file read errors in restricted environments
+  }
+  return '';
+}
 
 const upload = multer({
   dest: os.tmpdir(),
@@ -57,8 +90,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label = 'Request'): Pro
 
 function resolveApiKey(): string {
   return (
-    getConfiguredApiKey() ||
-    GEMINI_CONFIGURED_API_KEY ||
+    readKeyFromSeparateConfigFile() ||
+    dynamicConfiguredKey ||
     process.env.GEMINI_API_KEY ||
     process.env.API_KEY ||
     ''
@@ -1843,9 +1876,14 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
+    process.env.DISABLE_HMR = 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        watch: null,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
