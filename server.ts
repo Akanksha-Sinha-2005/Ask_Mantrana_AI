@@ -7,7 +7,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Modality, GenerateContentResponse, ThinkingLevel } from '@google/genai';
-import { GEMINI_CONFIGURED_API_KEY } from './apiKey.config';
+import { GEMINI_CONFIGURED_API_KEY, getConfiguredApiKey } from './apiKey.config';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -57,6 +57,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label = 'Request'): Pro
 
 function resolveApiKey(): string {
   return (
+    getConfiguredApiKey() ||
     GEMINI_CONFIGURED_API_KEY ||
     process.env.GEMINI_API_KEY ||
     process.env.API_KEY ||

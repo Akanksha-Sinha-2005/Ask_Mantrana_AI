@@ -7,5 +7,6 @@ coverage/
 .env*
 !.env.example
 apiKey.config.ts
+!apiKey.config.example.ts
 .data/
 
