@@ -1,0 +1,140 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['ownerId', 'email', 'username', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'email', 'username', 'createdAt', 'updatedAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.email is string
+        && data.email.size() >= 3
+        && data.email.size() <= 254
+        && data.email.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
+        && data.username is string
+        && data.username.size() >= 2
+        && data.username.size() <= 60
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidChatSession(data) {
+      return data.keys().hasAll(['id', 'ownerId', 'userEmail', 'title', 'messageCount', 'messagesSummary', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerId', 'userEmail', 'title', 'messageCount', 'messagesSummary', 'createdAt', 'updatedAt'])
+        && data.id is string
+        && data.id.size() >= 1
+        && data.id.size() <= 128
+        && data.id.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == request.auth.uid
+        && data.userEmail is string
+        && data.userEmail.size() >= 3
+        && data.userEmail.size() <= 254
+        && data.title is string
+        && data.title.size() >= 1
+        && data.title.size() <= 200
+        && data.messageCount is int
+        && data.messageCount >= 0
+        && data.messageCount <= 5000
+        && data.messagesSummary is string
+        && data.messagesSummary.size() >= 2
+        && data.messagesSummary.size() <= 900000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // 4. User Profile Collection (/users/{userId})
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['username', 'updatedAt']);
+
+      allow delete: if false;
+
+      // 5. User Chat Sessions Subcollection (/users/{userId}/sessions/{sessionId})
+      match /sessions/{sessionId} {
+        allow get: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(sessionId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+
+        allow list: if isOwner(userId)
+          && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(sessionId)
+          && isValidChatSession(incoming())
+          && incoming().id == sessionId
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(sessionId)
+          && isValidChatSession(incoming())
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().userEmail == existing().userEmail
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'messageCount', 'messagesSummary', 'updatedAt'])
+          && get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+
+        allow delete: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(sessionId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+      }
+    }
+  }
+}

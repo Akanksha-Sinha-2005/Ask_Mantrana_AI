@@ -1,0 +1,123 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user account profile storing email and username.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Normalized email address of the user.",
+          "minLength": 3,
+          "maxLength": 254,
+          "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Display username chosen by the user.",
+          "minLength": 2,
+          "maxLength": 60
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the account profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the account profile was last updated."
+        }
+      },
+      "required": ["ownerId", "email", "username", "createdAt", "updatedAt"]
+    },
+    "ChatSessionDoc": {
+      "title": "ChatSessionDoc",
+      "description": "Saved chat conversation belonging to a specific user email account.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique chat session identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the session owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Email address associated with this saved chat session.",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "title": {
+          "type": "string",
+          "description": "Conversation title.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "messageCount": {
+          "type": "integer",
+          "description": "Total number of messages in the conversation.",
+          "minimum": 0,
+          "maximum": 5000
+        },
+        "messagesSummary": {
+          "type": "string",
+          "description": "Serialized conversation messages bounded for Firestore document storage.",
+          "minLength": 2,
+          "maxLength": 900000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the chat session was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the chat session was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "userEmail",
+        "title",
+        "messageCount",
+        "messagesSummary",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "User profile document keyed by Firebase Auth UID."
+    },
+    "/users/{userId}/sessions/{sessionId}": {
+      "schema": {
+        "$ref": "#/entities/ChatSessionDoc"
+      },
+      "description": "Saved chat sessions belonging to the user."
+    }
+  }
+}
