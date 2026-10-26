@@ -13,8 +13,6 @@ import {
   Keyboard,
   Link2,
   Loader2,
-  LogIn,
-  LogOut,
   MapPin,
   Menu,
   MessageSquare,
@@ -26,7 +24,6 @@ import {
   Smartphone,
   Sun,
   UploadCloud,
-  User,
   Volume2,
   VolumeX,
   X,
@@ -186,11 +183,13 @@ export default function App() {
     }
   }, [theme]);
 
-  // User Account & Auth Modal state
+  // User Account & Auth Modal state (prompt to create account if not signed in)
   const [userAccount, setUserAccount] = useState<UserAccount | null>(() =>
     getSavedUserAccount()
   );
-  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(
+    () => !getSavedUserAccount()
+  );
 
   // Sessions & active chat state
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -565,7 +564,11 @@ export default function App() {
   }, [activeSession?.id, activeSession?.messages.length, scrollToBottom]);
 
   const updateSessionState = useCallback(
-    (sessionId: string, updater: (prev: ChatSession) => ChatSession) => {
+    (
+      sessionId: string,
+      updater: (prev: ChatSession) => ChatSession,
+      persist = true
+    ) => {
       const activeEmail = userAccount?.email || 'guest';
       setSessions((prevSessions) => {
         const idx = prevSessions.findIndex((s) => s.id === sessionId);
@@ -574,7 +577,9 @@ export default function App() {
           ...updater(prevSessions[idx]),
           userEmail: activeEmail,
         };
-        saveSession(updated, activeEmail);
+        if (persist) {
+          saveSession(updated, activeEmail);
+        }
         const next = [...prevSessions];
         next[idx] = updated;
         next.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -978,23 +983,27 @@ export default function App() {
               throw new Error(`Video generation ${pollData.status}.`);
             }
 
-            updateSessionState(sessionId, (s) => ({
-              ...s,
-              messages: s.messages.map((m) =>
-                m.id === modelMsgId
-                  ? {
-                      ...m,
-                      videoProgress: {
-                        interactionId,
-                        status: 'in_progress',
-                        elapsedSeconds,
-                        stepCount: pollData.stepCount || 0,
-                        latestNote: pollData.latestNote,
-                      },
-                    }
-                  : m
-              ),
-            }));
+            updateSessionState(
+              sessionId,
+              (s) => ({
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === modelMsgId
+                    ? {
+                        ...m,
+                        videoProgress: {
+                          interactionId,
+                          status: 'in_progress',
+                          elapsedSeconds,
+                          stepCount: pollData.stepCount || 0,
+                          latestNote: pollData.latestNote,
+                        },
+                      }
+                    : m
+                ),
+              }),
+              false
+            );
           }
           return;
         }
@@ -1154,19 +1163,23 @@ export default function App() {
                   const evt = JSON.parse(jsonStr);
                   if (evt.type === 'delta' && evt.text) {
                     accumulatedText += evt.text;
-                    updateSessionState(sessionId, (s) => ({
-                      ...s,
-                      messages: s.messages.map((m) =>
-                        m.id === modelMsgId
-                          ? {
-                              ...m,
-                              text: accumulatedText,
-                              isStreaming: true,
-                              error: undefined,
-                            }
-                          : m
-                      ),
-                    }));
+                    updateSessionState(
+                      sessionId,
+                      (s) => ({
+                        ...s,
+                        messages: s.messages.map((m) =>
+                          m.id === modelMsgId
+                            ? {
+                                ...m,
+                                text: accumulatedText,
+                                isStreaming: true,
+                                error: undefined,
+                              }
+                            : m
+                        ),
+                      }),
+                      false
+                    );
                   } else if (evt.type === 'sources' && Array.isArray(evt.sources)) {
                     collectedSources = evt.sources;
                   } else if (evt.type === 'error') {
@@ -2016,7 +2029,7 @@ export default function App() {
             </div>
 
 
-            {/* Zone 3: Responsive Screen Mode Switcher, Email Login / User Badge, Export & Theme Toggle */}
+            {/* Zone 3: Responsive Screen Mode Switcher (Login option is in Sidebar only) */}
             <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
               <button
                 type="button"
@@ -2059,38 +2072,6 @@ export default function App() {
                       : 'Laptop'}
                 </span>
               </button>
-
-              {/* Sign In / Logged-In User Badge */}
-              {userAccount ? (
-                <div className="inline-flex items-center gap-1 sm:gap-1.5 pl-2 pr-1 py-1 rounded-lg border border-teal-200 dark:border-teal-900/80 bg-teal-50/70 dark:bg-teal-950/40 text-xs text-teal-900 dark:text-teal-200">
-                  <User className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
-                  <span
-                    className="font-medium max-w-[76px] sm:max-w-[140px] truncate"
-                    title={`${userAccount.username} (${userAccount.email})`}
-                  >
-                    {userAccount.username}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={handleSignOut}
-                    className="p-1 rounded-md text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 hover:bg-white/70 dark:hover:bg-slate-800 transition-colors cursor-pointer"
-                    title={`Sign out (${userAccount.email})`}
-                    aria-label="Sign out"
-                  >
-                    <LogOut className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setIsAuthModalOpen(true)}
-                  className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                  title="Sign in with your email, username, and password to save chats"
-                >
-                  <LogIn className="w-3.5 h-3.5" />
-                  <span>Sign in</span>
-                </button>
-              )}
             </div>
           </header>
 

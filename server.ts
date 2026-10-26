@@ -1515,15 +1515,15 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
     }
   });
 
-  // 7. Email, Username & Password Account Auth + Per-Email Chat Session Persistence
-  const dataDir = path.resolve(__dirname, '.data');
+  // 7. Username & Password Account Auth + Per-User Chat Session Persistence (No Email Required)
+  const dataDir = path.join(os.tmpdir(), 'mantrana-ai-data');
   const accountsFilePath = path.join(dataDir, 'accounts.json');
 
   interface StoredAccountRecord {
     uid: string;
-    email: string;
+    email: string; // internal storage key derived from username
     username: string;
-    passwordHash: string;
+    passwordHash: string; // global deterministic password hash to enforce unique passwords across all users
     createdAt: number;
     updatedAt: number;
   }
@@ -1541,12 +1541,45 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
       .digest('hex');
   }
 
+  function hashPasswordGlobal(password: string): string {
+    return crypto
+      .createHash('sha256')
+      .update(`mantrana-global-password-v2:${password}`)
+      .digest('hex');
+  }
+
   function emailToFileKey(email: string): string {
     return crypto
       .createHash('sha256')
       .update(email.trim().toLowerCase())
       .digest('hex')
       .slice(0, 32);
+  }
+
+  function validateUsernameFormat(username: string): string | null {
+    if (!username || username.length < 2 || username.length > 60) {
+      return 'Username must be between 2 and 60 characters long.';
+    }
+    if (!/^[a-zA-Z0-9]+$/.test(username)) {
+      return 'Username must contain characters (letters) and numbers only (no spaces or special characters).';
+    }
+    return null;
+  }
+
+  function validatePasswordComplexity(password: string): string | null {
+    if (!password || password.length < 8) {
+      return 'Password must be at least 8 characters long.';
+    }
+    if (!/[a-zA-Z]/.test(password)) {
+      return 'Password must contain at least 1 alphabet character (a-z or A-Z).';
+    }
+    if (!/[0-9]/.test(password)) {
+      return 'Password must contain at least 1 digit (0-9).';
+    }
+    if (!/[^a-zA-Z0-9\s]/.test(password)) {
+      return 'Password must contain at least 1 special character (e.g. !@#$%^&*).';
+    }
+    return null;
   }
 
   function readAccountsMap(): Record<string, StoredAccountRecord> {
@@ -1596,80 +1629,127 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
 
   app.post('/api/account/auth', (req, res) => {
     try {
-      const { mode = 'signup', email, username, password } = req.body as {
+      const {
+        mode = 'signup',
+        username,
+        password,
+        knownAccounts,
+      } = req.body as {
         mode?: 'signup' | 'login';
-        email?: string;
         username?: string;
         password?: string;
+        knownAccounts?: Array<{
+          uid?: string;
+          username?: string;
+          email?: string;
+          passwordHash?: string;
+          createdAt?: number;
+        }>;
       };
 
-      const normalizedEmail = (email || '').trim().toLowerCase();
       const trimmedUsername = (username || '').trim();
+      const usernameLower = trimmedUsername.toLowerCase();
       const rawPassword = password || '';
 
-      if (!normalizedEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
-        res.status(400).json({ error: 'Please enter a valid email address.' });
+      const usernameErr = validateUsernameFormat(trimmedUsername);
+      if (usernameErr) {
+        res.status(400).json({ error: usernameErr });
         return;
       }
 
-      if (rawPassword.length < 4) {
-        res
-          .status(400)
-          .json({ error: 'Password must be at least 4 characters long.' });
+      if (mode === 'signup') {
+        const passwordErr = validatePasswordComplexity(rawPassword);
+        if (passwordErr) {
+          res.status(400).json({ error: passwordErr });
+          return;
+        }
+      } else if (!rawPassword) {
+        res.status(400).json({ error: 'Please enter your password.' });
         return;
       }
 
       const accounts = readAccountsMap();
-      const existing = accounts[normalizedEmail];
-      const incomingHash = hashPassword(normalizedEmail, rawPassword);
       const now = Date.now();
 
-      if (mode === 'signup') {
-        if (!trimmedUsername || trimmedUsername.length < 2) {
-          res
-            .status(400)
-            .json({ error: 'Please create a username (at least 2 characters).' });
-          return;
-        }
-
-        if (existing) {
-          // If the user already registered this email and entered the matching password, sign them in and update username
-          if (existing.passwordHash === incomingHash) {
-            existing.username = trimmedUsername || existing.username;
-            existing.updatedAt = now;
-            accounts[normalizedEmail] = existing;
-            writeAccountsMap(accounts);
-            const sessions = readUserSessions(normalizedEmail);
-            res.json({
-              user: {
-                uid: existing.uid,
-                email: existing.email,
-                username: existing.username,
-                createdAt: existing.createdAt,
-              },
-              sessions,
-            });
-            return;
+      // Re-hydrate any client-cached accounts so uniqueness checks and logins remain intact across server restarts
+      if (Array.isArray(knownAccounts)) {
+        let updated = false;
+        for (const ka of knownAccounts) {
+          const kaUsername = (ka?.username || '').trim();
+          const kaLower = kaUsername.toLowerCase();
+          if (!kaLower || !ka?.passwordHash) continue;
+          const alreadyPresent = Object.values(accounts).some(
+            (acc) => (acc.username || '').trim().toLowerCase() === kaLower
+          );
+          if (!alreadyPresent) {
+            const internalEmail = (ka.email || `${kaLower}@mantrana.local`).trim().toLowerCase();
+            accounts[internalEmail] = {
+              uid: ka.uid || `user-${emailToFileKey(internalEmail).slice(0, 20)}`,
+              email: internalEmail,
+              username: kaUsername,
+              passwordHash: ka.passwordHash,
+              createdAt: ka.createdAt || now,
+              updatedAt: now,
+            };
+            updated = true;
           }
+        }
+        if (updated) {
+          writeAccountsMap(accounts);
+        }
+      }
+
+      const allAccounts = Object.values(accounts);
+      const globalPasswordHash = hashPasswordGlobal(rawPassword);
+      const internalEmail = `${usernameLower}@mantrana.local`;
+
+      if (mode === 'signup') {
+        // Check uniqueness: No two users can have the same username OR the same password
+        const usernameExists = allAccounts.some(
+          (acc) => (acc.username || '').trim().toLowerCase() === usernameLower
+        );
+        const passwordExists = allAccounts.some(
+          (acc) =>
+            acc.passwordHash === globalPasswordHash ||
+            (acc.email && acc.passwordHash === hashPassword(acc.email, rawPassword))
+        );
+
+        if (usernameExists && passwordExists) {
           res.status(409).json({
             error:
-              'An account with this email already exists. Switch to Log In or enter your existing password.',
+              'This username or password already exists. No two users can have the same username or password.',
           });
           return;
         }
 
-        const uid = `user-${emailToFileKey(normalizedEmail).slice(0, 20)}`;
+        if (usernameExists) {
+          res.status(409).json({
+            error:
+              'This username or password already exists (this username is already taken). Please choose a different username.',
+          });
+          return;
+        }
+
+        if (passwordExists) {
+          res.status(409).json({
+            error:
+              'This username or password already exists (this password is already used by another user). Please choose a different password.',
+          });
+          return;
+        }
+
+        const uid = `user-${emailToFileKey(internalEmail).slice(0, 20)}`;
         const newRecord: StoredAccountRecord = {
           uid,
-          email: normalizedEmail,
+          email: internalEmail,
           username: trimmedUsername.slice(0, 60),
-          passwordHash: incomingHash,
+          passwordHash: globalPasswordHash,
           createdAt: now,
           updatedAt: now,
         };
-        accounts[normalizedEmail] = newRecord;
+        accounts[internalEmail] = newRecord;
         writeAccountsMap(accounts);
-        const sessions = readUserSessions(normalizedEmail);
+        const sessions = readUserSessions(internalEmail);
 
         res.json({
           user: {
@@ -1678,57 +1758,46 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
             username: newRecord.username,
             createdAt: newRecord.createdAt,
           },
+          passwordHash: globalPasswordHash,
           sessions,
         });
         return;
       }
 
       // mode === 'login'
+      const existing = allAccounts.find(
+        (acc) => (acc.username || '').trim().toLowerCase() === usernameLower
+      );
+
       if (!existing) {
-        // If account doesn't exist yet on this server, create it seamlessly using the provided username (or email prefix)
-        const fallbackUsername =
-          trimmedUsername.length >= 2
-            ? trimmedUsername.slice(0, 60)
-            : normalizedEmail.split('@')[0].slice(0, 60) || 'User';
-        const uid = `user-${emailToFileKey(normalizedEmail).slice(0, 20)}`;
-        const createdRecord: StoredAccountRecord = {
-          uid,
-          email: normalizedEmail,
-          username: fallbackUsername,
-          passwordHash: incomingHash,
-          createdAt: now,
-          updatedAt: now,
-        };
-        accounts[normalizedEmail] = createdRecord;
-        writeAccountsMap(accounts);
-        const sessions = readUserSessions(normalizedEmail);
-        res.json({
-          user: {
-            uid: createdRecord.uid,
-            email: createdRecord.email,
-            username: createdRecord.username,
-            createdAt: createdRecord.createdAt,
-          },
-          sessions,
+        res.status(404).json({
+          error:
+            'Account not found with this username. Please check your username or switch to Create Account.',
         });
         return;
       }
 
-      if (existing.passwordHash !== incomingHash) {
-        res
-          .status(401)
-          .json({ error: 'Incorrect password for this email account. Please try again.' });
+      const matchesGlobal = existing.passwordHash === globalPasswordHash;
+      const matchesLegacy =
+        Boolean(existing.email) &&
+        existing.passwordHash === hashPassword(existing.email, rawPassword);
+
+      if (!matchesGlobal && !matchesLegacy) {
+        res.status(401).json({
+          error: 'Incorrect username or password. Please try again.',
+        });
         return;
       }
 
-      if (trimmedUsername.length >= 2) {
-        existing.username = trimmedUsername.slice(0, 60);
+      // Upgrade legacy hash to global hash if needed
+      if (!matchesGlobal && matchesLegacy) {
+        existing.passwordHash = globalPasswordHash;
         existing.updatedAt = now;
-        accounts[normalizedEmail] = existing;
+        accounts[existing.email] = existing;
         writeAccountsMap(accounts);
       }
 
-      const sessions = readUserSessions(normalizedEmail);
+      const sessions = readUserSessions(existing.email);
       res.json({
         user: {
           uid: existing.uid,
@@ -1736,59 +1805,12 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
           username: existing.username,
           createdAt: existing.createdAt,
         },
+        passwordHash: globalPasswordHash,
         sessions,
       });
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Authentication failed.',
-      });
-    }
-  });
-
-  app.post('/api/account/oauth-sync', (req, res) => {
-    try {
-      const { uid, email, username } = req.body as {
-        uid?: string;
-        email?: string;
-        username?: string;
-      };
-      const normalizedEmail = (email || '').trim().toLowerCase();
-      if (!normalizedEmail) {
-        res.status(400).json({ error: 'Email is required.' });
-        return;
-      }
-      const accounts = readAccountsMap();
-      const now = Date.now();
-      const existing = accounts[normalizedEmail];
-      const resolvedUsername =
-        (username || '').trim() ||
-        existing?.username ||
-        normalizedEmail.split('@')[0] ||
-        'User';
-      const resolvedUid = uid || existing?.uid || `user-${emailToFileKey(normalizedEmail).slice(0, 20)}`;
-
-      accounts[normalizedEmail] = {
-        uid: resolvedUid,
-        email: normalizedEmail,
-        username: resolvedUsername.slice(0, 60),
-        passwordHash: existing?.passwordHash || '',
-        createdAt: existing?.createdAt || now,
-        updatedAt: now,
-      };
-      writeAccountsMap(accounts);
-      const sessions = readUserSessions(normalizedEmail);
-      res.json({
-        user: {
-          uid: resolvedUid,
-          email: normalizedEmail,
-          username: resolvedUsername.slice(0, 60),
-          createdAt: accounts[normalizedEmail].createdAt,
-        },
-        sessions,
-      });
-    } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to sync account.',
       });
     }
   });
@@ -1866,30 +1888,47 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
     }
   });
 
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
+
   // Serve frontend via Vite in development or static dist in production
   const distPath = path.resolve(__dirname, 'dist');
-  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(distPath);
+  const distIndexHtml = path.join(distPath, 'index.html');
+  const isProd =
+    (process.env.NODE_ENV === 'production' ||
+      process.env.npm_lifecycle_event === 'start') &&
+    fs.existsSync(distIndexHtml);
+
+  const port = Number(process.env.PORT) || 3000;
 
   if (isProd) {
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(distIndexHtml);
     });
   } else {
     process.env.DISABLE_HMR = 'true';
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-        watch: null,
-      },
-      appType: 'spa',
+    const viteReadyPromise = import('vite').then(({ createServer: createViteServer }) =>
+      createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: false,
+          watch: null,
+        },
+        appType: 'spa',
+      })
+    );
+    app.use(async (req, res, next) => {
+      try {
+        const vite = await viteReadyPromise;
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
     });
-    app.use(vite.middlewares);
   }
 
-  const port = Number(process.env.PORT) || 3000;
   app.listen(port, '0.0.0.0', () => {
     console.log(`Mantrana AI server listening on http://0.0.0.0:${port}`);
   });

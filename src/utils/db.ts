@@ -8,18 +8,70 @@ import {
 const DB_NAME = 'mantrana_ai_db';
 const DB_VERSION = 2;
 const STORE_SESSIONS = 'sessions';
-const ACTIVE_ACCOUNT_STORAGE_KEY = 'mantrana-active-user-account';
+const ACTIVE_ACCOUNT_STORAGE_KEY = 'mantrana-active-user-account-v2';
+const REGISTERED_ACCOUNTS_STORAGE_KEY = 'mantrana-registered-accounts-v1';
+
+export interface CachedRegisteredAccount {
+  uid: string;
+  username: string;
+  email: string;
+  passwordHash: string;
+  createdAt: number;
+}
+
+export function getRegisteredAccounts(): CachedRegisteredAccount[] {
+  try {
+    const raw = localStorage.getItem(REGISTERED_ACCOUNTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item) =>
+        item &&
+        typeof item.username === 'string' &&
+        typeof item.passwordHash === 'string'
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveRegisteredAccount(entry: CachedRegisteredAccount): void {
+  try {
+    const existing = getRegisteredAccounts();
+    const lower = entry.username.trim().toLowerCase();
+    const filtered = existing.filter(
+      (a) => a.username.trim().toLowerCase() !== lower
+    );
+    filtered.push({
+      uid: entry.uid,
+      username: entry.username.trim(),
+      email: (entry.email || `${lower}@mantrana.local`).trim().toLowerCase(),
+      passwordHash: entry.passwordHash,
+      createdAt: entry.createdAt || Date.now(),
+    });
+    localStorage.setItem(REGISTERED_ACCOUNTS_STORAGE_KEY, JSON.stringify(filtered));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 export function getSavedUserAccount(): UserAccount | null {
   try {
     const raw = localStorage.getItem(ACTIVE_ACCOUNT_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.email === 'string' && typeof parsed.username === 'string') {
+    if (parsed && typeof parsed.username === 'string' && parsed.username.trim()) {
+      const cleanUsername = parsed.username.trim();
+      const internalEmail = (
+        parsed.email || `${cleanUsername.toLowerCase()}@mantrana.local`
+      )
+        .trim()
+        .toLowerCase();
       return {
-        uid: parsed.uid || `user-${parsed.email}`,
-        email: parsed.email.trim().toLowerCase(),
-        username: parsed.username.trim(),
+        uid: parsed.uid || `user-${cleanUsername.toLowerCase()}`,
+        email: internalEmail,
+        username: cleanUsername,
         createdAt: parsed.createdAt || Date.now(),
       };
     }
@@ -34,11 +86,18 @@ export function setSavedUserAccount(account: UserAccount | null): void {
     if (!account) {
       localStorage.removeItem(ACTIVE_ACCOUNT_STORAGE_KEY);
     } else {
+      const cleanUsername = account.username.trim();
+      const internalEmail = (
+        account.email || `${cleanUsername.toLowerCase()}@mantrana.local`
+      )
+        .trim()
+        .toLowerCase();
       localStorage.setItem(
         ACTIVE_ACCOUNT_STORAGE_KEY,
         JSON.stringify({
           ...account,
-          email: account.email.trim().toLowerCase(),
+          username: cleanUsername,
+          email: internalEmail,
         })
       );
     }
@@ -178,6 +237,39 @@ export async function getAllSessions(userEmail?: string): Promise<ChatSession[]>
   return finalSessions;
 }
 
+const pendingServerSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function buildCompactSessionForServer(session: ChatSession): ChatSession {
+  return {
+    ...session,
+    messages: session.messages.map((m) => ({
+      ...m,
+      isStreaming: false,
+      attachments: m.attachments?.map((a) => ({
+        ...a,
+        extractedText:
+          a.extractedText && a.extractedText.length < 30000
+            ? a.extractedText
+            : undefined,
+        base64Data:
+          a.base64Data && a.base64Data.length < 120000
+            ? a.base64Data
+            : undefined,
+      })),
+      generatedMedia: m.generatedMedia
+        ? {
+            ...m.generatedMedia,
+            base64Data:
+              m.generatedMedia.base64Data &&
+              m.generatedMedia.base64Data.length < 200000
+                ? m.generatedMedia.base64Data
+                : undefined,
+          }
+        : undefined,
+    })),
+  };
+}
+
 export async function saveSession(
   session: ChatSession,
   userEmail?: string
@@ -195,22 +287,35 @@ export async function saveSession(
   await putLocalSession(taggedSession);
 
   if (normalizedEmail !== 'guest') {
-    // Sync to server-side per-email persistence
-    fetch('/api/account/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: normalizedEmail,
-        session: taggedSession,
-      }),
-    }).catch(() => {
-      // ignore network error
-    });
+    const syncKey = `${normalizedEmail}:${taggedSession.id}`;
+    const existingTimer = pendingServerSyncTimers.get(syncKey);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
 
-    // Sync to Firestore if Firebase Auth user is active
-    syncSessionToFirestore(taggedSession, normalizedEmail).catch(() => {
-      // ignore
-    });
+    const timer = setTimeout(() => {
+      pendingServerSyncTimers.delete(syncKey);
+      const compactSession = buildCompactSessionForServer(taggedSession);
+
+      // Sync to server-side per-email persistence
+      fetch('/api/account/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedEmail,
+          session: compactSession,
+        }),
+      }).catch(() => {
+        // ignore network error
+      });
+
+      // Sync to Firestore if Firebase Auth user is active
+      syncSessionToFirestore(taggedSession, normalizedEmail).catch(() => {
+        // ignore
+      });
+    }, 350);
+
+    pendingServerSyncTimers.set(syncKey, timer);
   }
 }
 

@@ -7,7 +7,6 @@ import {
   Keyboard,
   LogIn,
   LogOut,
-  Mail,
   MessageSquare,
   Moon,
   PanelLeftClose,
@@ -554,10 +553,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </p>
                 <p
                   className="text-[11px] text-slate-500 dark:text-slate-400 truncate flex items-center gap-1"
-                  title={`Chats saved to ${userAccount.email}`}
+                  title={`Signed in as ${userAccount.username}`}
                 >
-                  <Mail className="w-3 h-3 text-teal-600 dark:text-teal-400 shrink-0" />
-                  <span className="truncate">{userAccount.email}</span>
+                  <User className="w-3 h-3 text-teal-600 dark:text-teal-400 shrink-0" />
+                  <span className="truncate">Signed in · Chats saved</span>
                 </p>
               </div>
             </div>
@@ -566,8 +565,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 type="button"
                 onClick={onSignOut}
                 className="p-2 rounded-lg text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer shrink-0"
-                title="Sign out"
-                aria-label="Sign out"
+                title="Log out"
+                aria-label="Log out"
               >
                 <LogOut className="w-4 h-4" />
               </button>
@@ -587,10 +586,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
             <div className="min-w-0 flex-1">
               <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                Sign in with Email
+                Log In / Create Account
               </p>
               <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                Save previous chats to your email
+                Sign in with username &amp; password
               </p>
             </div>
           </button>

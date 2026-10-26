@@ -97,8 +97,10 @@ testConnection();
 // Blueprint validation constants (synced verbatim with firebase-blueprint.json & firestore.rules)
 export const USER_ID_PATTERN = /^[a-zA-Z0-9_\-]+$/;
 export const EMAIL_PATTERN = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+export const USERNAME_ALPHANUMERIC_PATTERN = /^[a-zA-Z0-9]+$/;
 export const USERNAME_MIN_LENGTH = 2;
 export const USERNAME_MAX_LENGTH = 60;
+export const PASSWORD_MIN_LENGTH = 8;
 export const SESSION_TITLE_MAX_LENGTH = 200;
 export const MESSAGES_SUMMARY_MAX_LENGTH = 850000;
 

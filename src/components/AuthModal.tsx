@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import {
   AlertCircle,
+  Check,
   CheckCircle2,
   Eye,
   EyeOff,
   Loader2,
   Lock,
   LogIn,
-  Mail,
   User,
   UserPlus,
   X,
@@ -15,16 +15,16 @@ import {
 import {
   auth,
   createUserWithEmailAndPassword,
-  EMAIL_PATTERN,
   ensureFirestoreUserProfile,
-  googleProvider,
+  PASSWORD_MIN_LENGTH,
   signInWithEmailAndPassword,
-  signInWithPopup,
   updateProfile,
+  USERNAME_ALPHANUMERIC_PATTERN,
   USERNAME_MAX_LENGTH,
   USERNAME_MIN_LENGTH,
 } from '../firebase';
 import { ChatSession, UserAccount } from '../types';
+import { getRegisteredAccounts, saveRegisteredAccount } from '../utils/db';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -38,7 +38,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   onAuthSuccess,
 }) => {
   const [authTab, setAuthTab] = useState<'signup' | 'login'>('signup');
-  const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -47,52 +46,85 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   if (!isOpen) return null;
 
+  const trimmedUsername = username.trim();
+  const isUsernameLengthOk =
+    trimmedUsername.length >= USERNAME_MIN_LENGTH &&
+    trimmedUsername.length <= USERNAME_MAX_LENGTH;
+  const isUsernameAlphanumeric = USERNAME_ALPHANUMERIC_PATTERN.test(trimmedUsername);
+  const isUsernameValid = isUsernameLengthOk && isUsernameAlphanumeric;
+
+  const hasMinLength = password.length >= PASSWORD_MIN_LENGTH;
+  const hasLetter = /[a-zA-Z]/.test(password);
+  const hasDigit = /[0-9]/.test(password);
+  const hasSpecialChar = /[^a-zA-Z0-9\s]/.test(password);
+  const isPasswordValid =
+    hasMinLength && hasLetter && hasDigit && hasSpecialChar;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
 
-    const normalizedEmail = email.trim().toLowerCase();
-    const trimmedUsername = username.trim();
-
-    if (!normalizedEmail || !EMAIL_PATTERN.test(normalizedEmail)) {
-      setErrorMsg('Please enter a valid email address (for example, you@example.com).');
+    if (!trimmedUsername) {
+      setErrorMsg('Please enter a username.');
       return;
     }
 
-    if (
-      authTab === 'signup' &&
-      (trimmedUsername.length < USERNAME_MIN_LENGTH ||
-        trimmedUsername.length > USERNAME_MAX_LENGTH)
-    ) {
+    if (!isUsernameLengthOk) {
       setErrorMsg(
-        `Please create a username between ${USERNAME_MIN_LENGTH} and ${USERNAME_MAX_LENGTH} characters.`
+        `Username must be between ${USERNAME_MIN_LENGTH} and ${USERNAME_MAX_LENGTH} characters long.`
       );
       return;
     }
 
-    if (password.length < 6) {
-      setErrorMsg('Password must be at least 6 characters long.');
+    if (!isUsernameAlphanumeric) {
+      setErrorMsg(
+        'Username must contain characters (letters) and numbers only (no spaces or special characters).'
+      );
+      return;
+    }
+
+    if (authTab === 'signup') {
+      if (!hasMinLength) {
+        setErrorMsg(
+          `Password must be at least ${PASSWORD_MIN_LENGTH} characters long.`
+        );
+        return;
+      }
+      if (!hasLetter || !hasDigit || !hasSpecialChar) {
+        setErrorMsg(
+          'Password must be at least 8 characters long and include at least 1 character (letter), 1 digit, and 1 special character.'
+        );
+        return;
+      }
+    } else if (!password) {
+      setErrorMsg('Please enter your password.');
       return;
     }
 
     setIsSubmitting(true);
     try {
-      // 1. Authenticate and persist with our server-backed account store
+      const knownAccounts = getRegisteredAccounts();
+
+      // 1. Authenticate and persist with our server-backed account store (enforcing unique username & unique password)
       const resp = await fetch('/api/account/auth', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mode: authTab,
-          email: normalizedEmail,
-          username:
-            trimmedUsername || normalizedEmail.split('@')[0] || 'MantranaUser',
+          username: trimmedUsername,
           password,
+          knownAccounts,
         }),
       });
       const data = await resp.json();
 
       if (!resp.ok || data.error) {
-        setErrorMsg(data.error || 'Could not sign in with this email account.');
+        setErrorMsg(
+          data.error ||
+            (authTab === 'signup'
+              ? 'This username or password already exists.'
+              : 'Could not log in with these credentials.')
+        );
         setIsSubmitting(false);
         return;
       }
@@ -102,12 +134,25 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         ? data.sessions
         : [];
 
-      // 2. Also attempt Firebase Auth Email/Password so Firestore sync activates if enabled in Firebase Console
+      if (data.passwordHash && resolvedUser) {
+        saveRegisteredAccount({
+          uid: resolvedUser.uid,
+          username: resolvedUser.username,
+          email: resolvedUser.email,
+          passwordHash: data.passwordHash,
+          createdAt: resolvedUser.createdAt,
+        });
+      }
+
+      // 2. Background Firebase Auth sync using internal synthesized identifier (user is never asked for email)
+      const internalEmail =
+        resolvedUser.email ||
+        `${trimmedUsername.toLowerCase()}@mantrana.local`;
       try {
         if (authTab === 'signup') {
           const cred = await createUserWithEmailAndPassword(
             auth,
-            normalizedEmail,
+            internalEmail,
             password
           );
           if (cred.user) {
@@ -123,32 +168,25 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         } else {
           const cred = await signInWithEmailAndPassword(
             auth,
-            normalizedEmail,
+            internalEmail,
             password
           );
           if (cred.user) {
-            if (trimmedUsername && cred.user.displayName !== trimmedUsername) {
-              await updateProfile(cred.user, { displayName: trimmedUsername });
-            }
             resolvedUser = {
               ...resolvedUser,
               uid: cred.user.uid,
-              username:
-                trimmedUsername ||
-                cred.user.displayName ||
-                resolvedUser.username,
+              username: cred.user.displayName || resolvedUser.username,
             };
             await ensureFirestoreUserProfile(resolvedUser);
           }
         }
       } catch (fbErr: any) {
         const code = String(fbErr?.code || '');
-        // If user already exists in Firebase Auth during signup, sign in with Firebase Auth
         if (code === 'auth/email-already-in-use') {
           try {
             const cred = await signInWithEmailAndPassword(
               auth,
-              normalizedEmail,
+              internalEmail,
               password
             );
             if (cred.user) {
@@ -159,8 +197,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             // Fall back to server account session
           }
         }
-        // Note: If Email/Password provider is not yet enabled in Firebase Console (auth/operation-not-allowed),
-        // the server + IndexedDB email account persistence handles authentication seamlessly.
       }
 
       onAuthSuccess(resolvedUser, serverSessions);
@@ -169,64 +205,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setErrorMsg(
         err instanceof Error
           ? err.message
-          : 'Network error while signing in. Please try again.'
+          : 'Network error while authenticating. Please try again.'
       );
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleGoogleSignIn = async () => {
-    setErrorMsg(null);
-    setIsSubmitting(true);
-    try {
-      const cred = await signInWithPopup(auth, googleProvider);
-      const fbUser = cred.user;
-      const userEmail = (fbUser.email || '').trim().toLowerCase();
-      if (!userEmail) {
-        throw new Error('Google account did not return an email address.');
-      }
-
-      const desiredUsername =
-        username.trim() ||
-        fbUser.displayName ||
-        userEmail.split('@')[0] ||
-        'User';
-
-      const resp = await fetch('/api/account/oauth-sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          uid: fbUser.uid,
-          email: userEmail,
-          username: desiredUsername,
-        }),
-      });
-      const data = await resp.json();
-
-      const account: UserAccount = data.user || {
-        uid: fbUser.uid,
-        email: userEmail,
-        username: desiredUsername,
-        createdAt: Date.now(),
-      };
-
-      await ensureFirestoreUserProfile(account);
-      const serverSessions: ChatSession[] = Array.isArray(data.sessions)
-        ? data.sessions
-        : [];
-
-      onAuthSuccess(account, serverSessions);
-      onClose();
-    } catch (err: any) {
-      const code = String(err?.code || '');
-      if (code !== 'auth/popup-closed-by-user') {
-        setErrorMsg(
-          err instanceof Error
-            ? err.message
-            : 'Google Sign-In could not be completed.'
-        );
-      }
     } finally {
       setIsSubmitting(false);
     }
@@ -245,18 +225,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         <div className="px-5 sm:px-6 pt-5 pb-3.5 border-b border-slate-200/80 dark:border-slate-800/80 flex items-center justify-between sticky top-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md z-10">
           <div>
             <h2 className="text-base font-bold font-display text-slate-900 dark:text-white">
-              Sign in to Mantrana AI
+              {authTab === 'signup'
+                ? 'Create Account on Mantrana AI'
+                : 'Log In to Mantrana AI'}
             </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Save and sync all your previous chats with your email account
-            </p>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="p-2 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
             title="Close modal (Esc)"
-            aria-label="Close sign in modal"
+            aria-label="Close account modal"
           >
             <X className="w-4 h-4" />
           </button>
@@ -307,60 +286,56 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </div>
           )}
 
-          {/* 1. Email Field */}
-          <div className="space-y-1">
-            <label
-              htmlFor="auth-email"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300"
-            >
-              Email Address
-            </label>
-            <div className="relative">
-              <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                id="auth-email"
-                type="email"
-                required
-                autoComplete="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@example.com"
-                className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
-              />
-            </div>
-          </div>
-
-          {/* 2. Username Field */}
-          <div className="space-y-1">
+          {/* 1. Username Field (Characters & Numbers Only) */}
+          <div className="space-y-1.5">
             <label
               htmlFor="auth-username"
               className="block text-xs font-medium text-slate-700 dark:text-slate-300"
             >
-              {authTab === 'signup' ? 'Create Username' : 'Username'}
+              Username
             </label>
             <div className="relative">
               <User className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 id="auth-username"
                 type="text"
-                required={authTab === 'signup'}
+                required
                 minLength={USERNAME_MIN_LENGTH}
                 maxLength={USERNAME_MAX_LENGTH}
                 autoComplete="username"
                 value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder={
-                  authTab === 'signup'
-                    ? 'Create your username (e.g. akanksha_s)'
-                    : 'Enter your username'
-                }
+                onChange={(e) => {
+                  setUsername(e.target.value);
+                  if (errorMsg) setErrorMsg(null);
+                }}
+                placeholder="e.g. abc123"
                 className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
               />
             </div>
+            {authTab === 'signup' && (
+              <p
+                className={`text-[11px] flex items-center gap-1.5 ${
+                  !trimmedUsername
+                    ? 'text-slate-500 dark:text-slate-400'
+                    : isUsernameValid
+                      ? 'text-teal-600 dark:text-teal-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                }`}
+              >
+                <Check
+                  className={`w-3 h-3 shrink-0 ${
+                    isUsernameValid ? 'opacity-100' : 'opacity-40'
+                  }`}
+                />
+                <span>
+                  Use letters (A–Z, a–z) and numbers (0–9) only — no spaces or symbols
+                </span>
+              </p>
+            )}
           </div>
 
-          {/* 3. Password Field */}
-          <div className="space-y-1">
+          {/* 2. Password Field */}
+          <div className="space-y-1.5">
             <label
               htmlFor="auth-password"
               className="block text-xs font-medium text-slate-700 dark:text-slate-300"
@@ -373,13 +348,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 id="auth-password"
                 type={showPassword ? 'text' : 'password'}
                 required
-                minLength={6}
+                minLength={authTab === 'signup' ? PASSWORD_MIN_LENGTH : 1}
                 autoComplete={
                   authTab === 'signup' ? 'new-password' : 'current-password'
                 }
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="At least 6 characters"
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (errorMsg) setErrorMsg(null);
+                }}
+                placeholder="********"
                 className="w-full pl-9 pr-10 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
               />
               <button
@@ -395,12 +373,41 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 )}
               </button>
             </div>
+
+            {authTab === 'signup' && (
+              <div className="grid grid-cols-2 gap-1.5 pt-1 text-[11px]">
+                {[
+                  { label: 'At least 8 characters', met: hasMinLength },
+                  { label: 'At least 1 letter (a–z)', met: hasLetter },
+                  { label: 'At least 1 digit (0–9)', met: hasDigit },
+                  { label: 'At least 1 special char', met: hasSpecialChar },
+                ].map((req) => (
+                  <div
+                    key={req.label}
+                    className={`flex items-center gap-1.5 ${
+                      !password
+                        ? 'text-slate-500 dark:text-slate-400'
+                        : req.met
+                          ? 'text-teal-600 dark:text-teal-400 font-medium'
+                          : 'text-amber-600 dark:text-amber-400'
+                    }`}
+                  >
+                    <Check
+                      className={`w-3 h-3 shrink-0 ${
+                        req.met ? 'opacity-100' : 'opacity-35'
+                      }`}
+                    />
+                    <span>{req.label}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="rounded-xl bg-teal-50/70 dark:bg-teal-950/30 border border-teal-200/70 dark:border-teal-900/60 px-3 py-2 flex items-center gap-2 text-[11px] text-teal-800 dark:text-teal-300">
             <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
             <span>
-              Your conversations are automatically saved to your email account so you can access them anytime you sign in.
+              No two users can share the same username or password. Your conversations are saved automatically to your account.
             </span>
           </div>
 
@@ -413,7 +420,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
                 <span>
-                  {authTab === 'signup' ? 'Creating account…' : 'Signing in…'}
+                  {authTab === 'signup' ? 'Creating account…' : 'Logging in…'}
                 </span>
               </>
             ) : (
@@ -421,34 +428,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 {authTab === 'signup' ? (
                   <>
                     <UserPlus className="w-4 h-4" />
-                    <span>Create Account & Save Chats</span>
+                    <span>Create Account</span>
                   </>
                 ) : (
                   <>
                     <LogIn className="w-4 h-4" />
-                    <span>Sign In with Email</span>
+                    <span>Log In</span>
                   </>
                 )}
               </>
             )}
-          </button>
-
-          <div className="relative py-1 flex items-center justify-center">
-            <div className="border-t border-slate-200 dark:border-slate-800 w-full" />
-            <span className="bg-white dark:bg-slate-900 px-2.5 text-[11px] text-slate-400 uppercase tracking-wider">
-              or
-            </span>
-            <div className="border-t border-slate-200 dark:border-slate-800 w-full" />
-          </div>
-
-          <button
-            type="button"
-            onClick={handleGoogleSignIn}
-            disabled={isSubmitting}
-            className="w-full py-2 px-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700/80 text-slate-700 dark:text-slate-200 text-xs font-medium transition-colors flex items-center justify-center gap-2 cursor-pointer"
-          >
-            <Mail className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-            <span>Continue with Google Account</span>
           </button>
         </form>
       </div>
