@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   AlertCircle,
   Check,
-  CheckCircle2,
   Eye,
   EyeOff,
   Loader2,
@@ -402,13 +401,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 ))}
               </div>
             )}
-          </div>
-
-          <div className="rounded-xl bg-teal-50/70 dark:bg-teal-950/30 border border-teal-200/70 dark:border-teal-900/60 px-3 py-2 flex items-center gap-2 text-[11px] text-teal-800 dark:text-teal-300">
-            <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
-            <span>
-              No two users can share the same username or password. Your conversations are saved automatically to your account.
-            </span>
           </div>
 
           <button

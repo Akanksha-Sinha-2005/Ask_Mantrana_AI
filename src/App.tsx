@@ -261,35 +261,136 @@ export default function App() {
     musicTrackType: 'clip',
   });
   const [userLocation, setUserLocation] = useState<
-    { latitude: number; longitude: number } | undefined
-  >(undefined);
+    { latitude: number; longitude: number; label?: string } | undefined
+  >(() => {
+    try {
+      const cached = sessionStorage.getItem('mantrana-user-location');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (
+          parsed &&
+          typeof parsed.latitude === 'number' &&
+          typeof parsed.longitude === 'number'
+        ) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return undefined;
+  });
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
 
+  const saveResolvedLocation = useCallback(
+    (loc: { latitude: number; longitude: number; label?: string }) => {
+      setUserLocation(loc);
+      try {
+        sessionStorage.setItem('mantrana-user-location', JSON.stringify(loc));
+      } catch {
+        // ignore
+      }
+    },
+    []
+  );
+
+  const resolveCurrentLocation = useCallback(async (): Promise<
+    { latitude: number; longitude: number; label?: string } | undefined
+  > => {
+    if (userLocation) return userLocation;
+
+    // 1. Try browser Geolocation API (using fast network/Wi-Fi positioning first)
+    const tryBrowserGeolocation = (): Promise<
+      { latitude: number; longitude: number; label?: string } | undefined
+    > =>
+      new Promise((resolve) => {
+        if (typeof navigator === 'undefined' || !('geolocation' in navigator)) {
+          resolve(undefined);
+          return;
+        }
+        let settled = false;
+        const safetyTimer = window.setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            resolve(undefined);
+          }
+        }, 7000);
+
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(safetyTimer);
+            resolve({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+            });
+          },
+          () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(safetyTimer);
+            resolve(undefined);
+          },
+          {
+            enableHighAccuracy: false,
+            timeout: 6500,
+            maximumAge: 600000,
+          }
+        );
+      });
+
+    const browserLoc = await tryBrowserGeolocation();
+    if (browserLoc) {
+      saveResolvedLocation(browserLoc);
+      return browserLoc;
+    }
+
+    // 2. Automatic client-side IP geolocation fallback if browser/iframe blocks or times out GPS
+    const ipEndpoints = [
+      'https://ipwho.is/',
+      'https://get.geojs.io/v1/ip/geo.json',
+      'https://ipapi.co/json/',
+    ];
+
+    for (const url of ipEndpoints) {
+      try {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 3500);
+        const resp = await fetch(url, { signal: controller.signal });
+        window.clearTimeout(timer);
+        if (!resp.ok) continue;
+        const data = await resp.json();
+        const lat = Number(data.latitude);
+        const lon = Number(data.longitude);
+        if (!Number.isNaN(lat) && !Number.isNaN(lon) && (lat !== 0 || lon !== 0)) {
+          const labelParts = [data.city, data.region || data.region_name, data.country || data.country_name]
+            .filter((p) => typeof p === 'string' && p.trim().length > 0);
+          const resolved = {
+            latitude: lat,
+            longitude: lon,
+            label: labelParts.length > 0 ? labelParts.join(', ') : undefined,
+          };
+          saveResolvedLocation(resolved);
+          return resolved;
+        }
+      } catch {
+        // try next IP geolocation provider
+      }
+    }
+
+    return undefined;
+  }, [saveResolvedLocation, userLocation]);
+
   // Request user location when Google Maps grounding is selected so nearby place queries have accurate coordinates
   useEffect(() => {
-    if (
-      generationOptions.chatGrounding === 'maps' &&
-      !userLocation &&
-      typeof navigator !== 'undefined' &&
-      'geolocation' in navigator
-    ) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setUserLocation({
-            latitude: pos.coords.latitude,
-            longitude: pos.coords.longitude,
-          });
-        },
-        () => {
-          // ignore if user declines geolocation
-        },
-        { timeout: 6000 }
-      );
+    if (generationOptions.chatGrounding === 'maps' && !userLocation) {
+      resolveCurrentLocation();
     }
-  }, [generationOptions.chatGrounding, userLocation]);
+  }, [generationOptions.chatGrounding, resolveCurrentLocation, userLocation]);
 
   // Toast notifications, copied message state, text-to-speech & export menu state
   const [toasts, setToasts] = useState<ToastNotice[]>([]);
@@ -1093,6 +1194,13 @@ export default function App() {
         });
 
         const urlsInPrompt = extractUrlsFromText(userMsg.text);
+        const needsLocationForTurn =
+          generationOptions.chatGrounding === 'maps' ||
+          /\b(my location|where am i|current location|near me|nearby|restaurants?|cafes?|coffee shops?|hotels?|hospitals?|pharmacies|directions|route to|where is|places to visit|tourist attractions?|things to do|landmarks?|distance|map|parks?|museums?|temples?|malls?|airports?|stations?|weather)\b/i.test(
+            userMsg.text || ''
+          );
+        const effectiveUserLocation =
+          userLocation || (needsLocationForTurn ? await resolveCurrentLocation() : undefined);
 
         let accumulatedText = '';
         let collectedSources: GroundingSource[] = [];
@@ -1137,7 +1245,7 @@ export default function App() {
                     ? 'auto'
                     : generationOptions.chatGrounding,
                 language: generationOptions.language,
-                userLocation,
+                userLocation: effectiveUserLocation,
               }),
               signal: abortController.signal,
             });
@@ -1309,7 +1417,14 @@ export default function App() {
         abortControllerRef.current = null;
       }
     },
-    [addToast, generationOptions, scrollToBottom, updateSessionState, userLocation]
+    [
+      addToast,
+      generationOptions,
+      resolveCurrentLocation,
+      scrollToBottom,
+      updateSessionState,
+      userLocation,
+    ]
   );
 
   // Load a generated image into Composer as a reference attachment for editing with gemini-nano-banana-2.1

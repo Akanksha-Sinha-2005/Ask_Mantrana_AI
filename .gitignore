@@ -9,4 +9,5 @@ coverage/
 apiKey.config.ts
 !apiKey.config.example.ts
 .data/
+.aistudio/
 

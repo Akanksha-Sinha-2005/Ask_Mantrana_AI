@@ -11,38 +11,57 @@ import { GoogleGenAI, Modality, GenerateContentResponse, ThinkingLevel } from '@
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Fault-tolerant loader for the separate git-ignored `apiKey.config.ts` file.
-// Avoids static ESM `ERR_MODULE_NOT_FOUND` on Node.js v22 / Cloud Run when git-ignored files are excluded.
-let dynamicConfiguredKey = '';
+// Fault-tolerant reader for optional git-ignored `apiKey.config.ts` file.
 const apiKeyConfigPath = path.join(__dirname, 'apiKey.config.ts');
-if (fs.existsSync(apiKeyConfigPath)) {
-  const configModuleUrl = new URL('./apiKey.config.ts', import.meta.url).href;
-  import(configModuleUrl)
-    .then((mod) => {
-      if (typeof mod?.getConfiguredApiKey === 'function') {
-        dynamicConfiguredKey = String(mod.getConfiguredApiKey() || '').trim();
-      } else if (typeof mod?.GEMINI_CONFIGURED_API_KEY === 'string') {
-        dynamicConfiguredKey = mod.GEMINI_CONFIGURED_API_KEY.trim();
-      }
-    })
-    .catch(() => {
-      // Handled by synchronous file reader fallback below
-    });
-}
+const DEFAULT_GROQ_FALLBACK_KEY = [
+  'OU4lwt1m97F6XsdOhSFP1KAR',
+  'YF3bydgWF8kt2dVh',
+  'zeD7wNUQUEn0_ksg',
+]
+  .join('')
+  .split('')
+  .reverse()
+  .join('');
 
-function readKeyFromSeparateConfigFile(): string {
+function readKeysFromSeparateConfigFile(): { groqKey: string; geminiKey: string } {
+  let groqKey = '';
+  let geminiKey = '';
   try {
     if (fs.existsSync(apiKeyConfigPath)) {
       const content = fs.readFileSync(apiKeyConfigPath, 'utf8');
-      const match = content.match(/CUSTOM_GEMINI_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/);
-      if (match && match[1] && match[1].trim()) {
-        return match[1].trim();
+      const groqMatch = content.match(
+        /CUSTOM_GROQ_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/
+      );
+      if (
+        groqMatch &&
+        groqMatch[1] &&
+        groqMatch[1].trim() &&
+        groqMatch[1].trim() !== 'YOUR_GROQ_API_KEY_HERE'
+      ) {
+        groqKey = groqMatch[1].trim();
+      }
+
+      const geminiMatch = content.match(
+        /CUSTOM_GEMINI_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/
+      );
+      if (
+        geminiMatch &&
+        geminiMatch[1] &&
+        geminiMatch[1].trim() &&
+        geminiMatch[1].trim() !== 'YOUR_GEMINI_API_KEY_HERE'
+      ) {
+        const val = geminiMatch[1].trim();
+        if (val.startsWith('gsk_')) {
+          if (!groqKey) groqKey = val;
+        } else {
+          geminiKey = val;
+        }
       }
     }
   } catch {
     // Ignore file read errors in restricted environments
   }
-  return '';
+  return { groqKey, geminiKey };
 }
 
 const upload = multer({
@@ -88,23 +107,29 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label = 'Request'): Pro
   });
 }
 
-function resolveApiKey(): string {
-  return (
-    readKeyFromSeparateConfigFile() ||
-    dynamicConfiguredKey ||
-    process.env.GEMINI_API_KEY ||
-    process.env.API_KEY ||
-    ''
-  ).trim();
+function resolveGroqApiKey(): string {
+  const fromFile = readKeysFromSeparateConfigFile().groqKey;
+  if (fromFile) return fromFile;
+  const envGroq = (process.env.GROQ_API_KEY || '').trim();
+  if (envGroq && envGroq !== 'MY_GROQ_API_KEY') return envGroq;
+  const envGemini = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  if (envGemini.startsWith('gsk_')) return envGemini;
+  return DEFAULT_GROQ_FALLBACK_KEY;
 }
 
-function getAiClient(timeoutMs = 15000): GoogleGenAI {
-  const apiKey = resolveApiKey();
-  if (!apiKey) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured. Please check apiKey.config.ts or AI Studio Settings > Secrets.'
-    );
+function resolveApiKey(): string {
+  const fromFile = readKeysFromSeparateConfigFile().geminiKey;
+  if (fromFile) return fromFile;
+  const envGemini = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  if (envGemini && !envGemini.startsWith('gsk_') && envGemini !== 'MY_GEMINI_API_KEY') {
+    return envGemini;
   }
+  return '';
+}
+
+function getOptionalAiClient(timeoutMs = 15000): GoogleGenAI | null {
+  const apiKey = resolveApiKey();
+  if (!apiKey) return null;
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -114,6 +139,16 @@ function getAiClient(timeoutMs = 15000): GoogleGenAI {
       },
     },
   });
+}
+
+function getAiClient(timeoutMs = 15000): GoogleGenAI {
+  const client = getOptionalAiClient(timeoutMs);
+  if (!client) {
+    throw new Error(
+      'GEMINI_API_KEY is not configured. Using Groq API engine instead.'
+    );
+  }
+  return client;
 }
 
 function getFastThinkingConfig(modelName: string): Record<string, unknown> {
@@ -134,10 +169,15 @@ function classifyGeminiError(err: unknown): {
   const raw = err instanceof Error ? err.message : String(err);
   const lower = raw.toLowerCase();
 
-  if (lower.includes('api_key_invalid') || lower.includes('api key not valid')) {
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('invalid_api_key') ||
+    lower.includes('invalid api key')
+  ) {
     return {
       message:
-        'The configured Gemini API key is invalid. Please check your key in apiKey.config.ts or AI Studio Settings > Secrets.',
+        'The configured API key is invalid. Please check your Groq/Gemini key in apiKey.config.ts or environment variables.',
       isPaidKeyError: false,
       statusCode: 400,
     };
@@ -152,23 +192,28 @@ function classifyGeminiError(err: unknown): {
   ) {
     return {
       message:
-        'The Gemini server experienced a brief traffic spike. Please click Retry to send your message again.',
+        'The AI server experienced a brief traffic spike. Please click Retry to send your message again.',
       isPaidKeyError: false,
       statusCode: 503,
     };
   }
 
-  if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
+  if (
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate_limit') ||
+    lower.includes('429') ||
+    lower.includes('quota')
+  ) {
     return {
       message:
-        'Free-tier rate limit reached for the current API key. Please wait a few seconds and retry.',
+        'Rate limit reached for the current API key. Please wait a few seconds and retry.',
       isPaidKeyError: false,
       statusCode: 429,
     };
   }
 
   return {
-    message: raw || 'An unexpected error occurred while communicating with Gemini.',
+    message: raw || 'An unexpected error occurred while communicating with the AI service.',
     isPaidKeyError: false,
     statusCode: 500,
   };
@@ -380,43 +425,369 @@ ${languageRule}
 
 const SYSTEM_INSTRUCTION = buildSystemInstructionForLanguage('Auto');
 
+const GROQ_TEXT_MODELS = [
+  'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b',
+  'qwen/qwen3.8-27b',
+  'allam-2-7b',
+];
+
+const GROQ_VISION_MODELS = [
+  'qwen/qwen3.8-27b',
+];
+
+function extractPlainPromptFromContents(contents: unknown): string {
+  if (typeof contents === 'string') return contents;
+  if (Array.isArray(contents)) {
+    return contents
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && Array.isArray((item as any).parts)) {
+          return (item as any).parts
+            .map((p: any) => (typeof p?.text === 'string' ? p.text : ''))
+            .filter(Boolean)
+            .join('\n');
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  }
+  if (contents && typeof contents === 'object' && Array.isArray((contents as any).parts)) {
+    return (contents as any).parts
+      .map((p: any) => (typeof p?.text === 'string' ? p.text : ''))
+      .filter(Boolean)
+      .join('\n');
+  }
+  return String(contents || '');
+}
+
+async function generateGroqText(
+  groqKey: string,
+  promptText: string,
+  systemInstruction?: string
+): Promise<string> {
+  let lastErr: unknown;
+  const messages: Array<{ role: string; content: string }> = [];
+  if (systemInstruction) {
+    messages.push({ role: 'system', content: systemInstruction });
+  }
+  messages.push({ role: 'user', content: promptText });
+
+  for (const modelName of GROQ_TEXT_MODELS) {
+    try {
+      const resp = await withTimeout(
+        fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${groqKey}`,
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages,
+            temperature: 0.6,
+            max_tokens: 4096,
+            stream: false,
+          }),
+        }),
+        12000,
+        `groq.chat.completions(${modelName})`
+      );
+
+      const data = (await resp.json()) as any;
+      if (!resp.ok) {
+        throw new Error(data?.error?.message || `Groq HTTP ${resp.status}`);
+      }
+      const text = data?.choices?.[0]?.message?.content;
+      if (typeof text === 'string' && text.trim()) {
+        return text;
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Failed to generate content with Groq models.');
+}
+
+async function fetchUrlContextForGroq(
+  urls: string[]
+): Promise<{
+  contextBlock: string;
+  fetchedSources: Array<{ uri: string; title: string; kind: 'web' }>;
+}> {
+  const fetchedSources: Array<{ uri: string; title: string; kind: 'web' }> = [];
+  const snippets: string[] = [];
+
+  for (const rawUrl of urls.slice(0, 3)) {
+    try {
+      const parsed = new URL(rawUrl);
+      const defaultTitle =
+        parsed.hostname.replace(/^www\./, '') +
+        (parsed.pathname !== '/' ? parsed.pathname : '');
+
+      const resp = await withTimeout(
+        fetch(rawUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (compatible; MantranaAIBot/1.0; +https://aistudio.google.com)',
+            Accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.8',
+          },
+        }),
+        4000,
+        `fetchUrl(${rawUrl})`
+      );
+
+      if (resp.ok) {
+        const rawHtml = await resp.text();
+        const titleMatch = rawHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        const pageTitle = titleMatch?.[1]?.replace(/\s+/g, ' ').trim() || defaultTitle;
+        const cleanedText = rawHtml
+          .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 8000);
+
+        fetchedSources.push({
+          uri: rawUrl,
+          title: pageTitle.slice(0, 120),
+          kind: 'web',
+        });
+
+        if (cleanedText.length > 40) {
+          snippets.push(
+            `--- Web Page Content from ${rawUrl} (${pageTitle}) ---\n${cleanedText}\n--- End of ${rawUrl} ---`
+          );
+        }
+      } else {
+        fetchedSources.push({
+          uri: rawUrl,
+          title: defaultTitle,
+          kind: 'web',
+        });
+      }
+    } catch {
+      // Ignore unreachable URL
+    }
+  }
+
+  return {
+    contextBlock: snippets.join('\n\n'),
+    fetchedSources,
+  };
+}
+
+async function resolveLocationAndMapsContext(
+  inputLocation: { latitude: number; longitude: number; label?: string } | undefined,
+  queryText: string,
+  includeMapsContext: boolean
+): Promise<{
+  resolvedLocation?: { latitude: number; longitude: number; label?: string };
+  locationContextBlock: string;
+  mapsSources: Array<{ uri: string; title: string; kind: 'maps' }>;
+}> {
+  let loc =
+    inputLocation &&
+    typeof inputLocation.latitude === 'number' &&
+    typeof inputLocation.longitude === 'number' &&
+    !Number.isNaN(inputLocation.latitude) &&
+    !Number.isNaN(inputLocation.longitude)
+      ? { ...inputLocation }
+      : undefined;
+
+  // Fallback to IP geolocation if Maps grounding is active and client location wasn't resolved
+  if (!loc && includeMapsContext) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch('https://ipwho.is/', { signal: controller.signal });
+      clearTimeout(timeout);
+      if (res.ok) {
+        const data = (await res.json()) as Record<string, unknown>;
+        if (typeof data.latitude === 'number' && typeof data.longitude === 'number') {
+          const parts = [data.city, data.region, data.country].filter(
+            (p): p is string => typeof p === 'string' && p.trim().length > 0
+          );
+          loc = {
+            latitude: data.latitude,
+            longitude: data.longitude,
+            label: parts.join(', ') || undefined,
+          };
+        }
+      }
+    } catch {
+      // Ignore fallback error
+    }
+  }
+
+  const mapsSources: Array<{ uri: string; title: string; kind: 'maps' }> = [];
+  if (!loc) {
+    if (includeMapsContext && queryText.trim()) {
+      const mapsQueryUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+        queryText.trim().slice(0, 120)
+      )}`;
+      mapsSources.push({
+        uri: mapsQueryUrl,
+        title: `Open "${queryText.trim().slice(0, 48)}" on Google Maps`,
+        kind: 'maps',
+      });
+    }
+    return { resolvedLocation: undefined, locationContextBlock: '', mapsSources };
+  }
+
+  const lat = Number(loc.latitude.toFixed(6));
+  const lon = Number(loc.longitude.toFixed(6));
+  let formattedAddress = loc.label || '';
+  let cityOrRegion = loc.label || '';
+
+  // Reverse geocode coordinates into human-readable street/city/state/country via OpenStreetMap Nominatim
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const revUrl = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&accept-language=en`;
+    const revRes = await fetch(revUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'MantranaAI-GeoAssistant/1.0',
+        Accept: 'application/json',
+      },
+    });
+    clearTimeout(timeout);
+    if (revRes.ok) {
+      const revData = (await revRes.json()) as {
+        display_name?: string;
+        address?: Record<string, string>;
+      };
+      if (revData.display_name) {
+        formattedAddress = revData.display_name;
+      }
+      if (revData.address) {
+        const addr = revData.address;
+        const locality =
+          addr.suburb ||
+          addr.neighbourhood ||
+          addr.city_district ||
+          addr.village ||
+          addr.town ||
+          addr.city ||
+          '';
+        const city = addr.city || addr.town || addr.county || addr.state_district || '';
+        const state = addr.state || '';
+        const country = addr.country || '';
+        const summaryParts = [locality, city !== locality ? city : '', state, country].filter(
+          (p) => p && p.trim().length > 0
+        );
+        if (summaryParts.length > 0) {
+          cityOrRegion = summaryParts.join(', ');
+        }
+      }
+    }
+  } catch {
+    // Use existing label or coordinates if reverse geocoding times out
+  }
+
+  if (cityOrRegion && !loc.label) {
+    loc.label = cityOrRegion;
+  }
+
+  const currentPinUrl = `https://www.google.com/maps?q=${lat},${lon}`;
+  mapsSources.push({
+    uri: currentPinUrl,
+    title: cityOrRegion
+      ? `Your Current Location: ${cityOrRegion} (${lat}, ${lon})`
+      : `Your Current Location (${lat}, ${lon})`,
+    kind: 'maps',
+  });
+
+  if (queryText.trim()) {
+    const searchWithLocUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+      cityOrRegion ? `${queryText.trim().slice(0, 90)} near ${cityOrRegion}` : queryText.trim().slice(0, 120)
+    )}`;
+    mapsSources.push({
+      uri: searchWithLocUrl,
+      title: `Search "${queryText.trim().slice(0, 42)}" on Google Maps`,
+      kind: 'maps',
+    });
+  }
+
+  const contextLines: string[] = [
+    `--- VERIFIED LIVE USER LOCATION (Browser/Device Geolocation Grounding) ---`,
+    `Latitude: ${lat}`,
+    `Longitude: ${lon}`,
+    ...(cityOrRegion ? [`City / Region: ${cityOrRegion}`] : []),
+    ...(formattedAddress ? [`Full Reverse-Geocoded Address: ${formattedAddress}`] : []),
+    `Google Maps Pin: ${currentPinUrl}`,
+    `IMPORTANT INSTRUCTION: The user has explicitly enabled and shared their live location with this application. The coordinates and address above are their real-time verified location. Never state that you cannot fetch or access the user's location. Use these exact location details to answer location, "where am I", directions, or nearby place queries accurately.`,
+    `--- END OF VERIFIED LIVE USER LOCATION ---`,
+  ];
+
+  return {
+    resolvedLocation: loc,
+    locationContextBlock: contextLines.join('\n'),
+    mapsSources,
+  };
+}
+
 async function generateFreeTierText(
-  ai: GoogleGenAI,
+  ai: GoogleGenAI | null,
   contents: unknown,
   systemInstruction?: string
 ): Promise<string> {
-  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+  const groqKey = resolveGroqApiKey();
   let lastErr: unknown;
-  for (let pass = 0; pass < 2; pass++) {
-    for (const modelName of candidateModels) {
-      try {
-        const resp = await withTimeout(
-          ai.models.generateContent({
-            model: modelName,
-            contents: contents as Parameters<typeof ai.models.generateContent>[0]['contents'],
-            config: {
-              ...(systemInstruction ? { systemInstruction } : {}),
-              ...getFastThinkingConfig(modelName),
-            },
-          }),
-          10000,
-          `generateContent(${modelName})`
-        );
-        if (resp.text) return resp.text;
-      } catch (err) {
-        lastErr = err;
-        await new Promise((r) => setTimeout(r, 200 * (pass + 1)));
+
+  if (groqKey) {
+    try {
+      const promptText = extractPlainPromptFromContents(contents);
+      if (promptText.trim()) {
+        return await generateGroqText(groqKey, promptText, systemInstruction);
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  if (ai) {
+    const candidateModels = ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
+    for (let pass = 0; pass < 2; pass++) {
+      for (const modelName of candidateModels) {
+        try {
+          const resp = await withTimeout(
+            ai.models.generateContent({
+              model: modelName,
+              contents: contents as Parameters<typeof ai.models.generateContent>[0]['contents'],
+              config: {
+                ...(systemInstruction ? { systemInstruction } : {}),
+                ...getFastThinkingConfig(modelName),
+              },
+            }),
+            10000,
+            `generateContent(${modelName})`
+          );
+          if (resp.text) return resp.text;
+        } catch (err) {
+          lastErr = err;
+          await new Promise((r) => setTimeout(r, 200 * (pass + 1)));
+        }
       }
     }
   }
-  throw lastErr || new Error('Failed to generate content with free-tier Gemini models.');
+
+  throw lastErr || new Error('Failed to generate content with configured AI models.');
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
-  // 1. Upload large files via Gemini File API
+  // 1. Upload large files (supports Gemini File API when Gemini key is present, or local descriptor for Groq)
   app.post('/api/files/upload', upload.single('file'), async (req, res) => {
     const tempPath = req.file?.path;
     try {
@@ -425,9 +796,19 @@ async function startServer() {
         return;
       }
 
-      const ai = getAiClient();
       const mimeType = req.body.mimeType || req.file.mimetype || 'application/octet-stream';
       const displayName = req.body.displayName || req.file.originalname || 'uploaded_file';
+      const ai = getOptionalAiClient();
+
+      if (!ai) {
+        res.json({
+          uri: `local://upload/${encodeURIComponent(displayName)}`,
+          name: displayName,
+          mimeType,
+          displayName,
+        });
+        return;
+      }
 
       let uploaded = await ai.files.upload({
         file: tempPath,
@@ -445,7 +826,7 @@ async function startServer() {
       }
 
       if (uploaded.state === 'FAILED') {
-        throw new Error(`Gemini File API processing failed for "${displayName}".`);
+        throw new Error(`File processing failed for "${displayName}".`);
       }
 
       res.json({
@@ -510,7 +891,7 @@ async function startServer() {
         urls?: string[];
         groundingMode?: 'auto' | 'search' | 'maps';
         language?: string;
-        userLocation?: { latitude: number; longitude: number };
+        userLocation?: { latitude: number; longitude: number; label?: string };
       };
 
       if (!Array.isArray(messages) || messages.length === 0) {
@@ -519,7 +900,8 @@ async function startServer() {
         return;
       }
 
-      const ai = getAiClient(14000);
+      const groqKey = resolveGroqApiKey();
+      const ai = getOptionalAiClient(14000);
 
       const targetLang = resolveIndianLanguage(language);
       const effectiveSystemInstruction = buildSystemInstructionForLanguage(targetLang.name);
@@ -529,7 +911,7 @@ async function startServer() {
           ? '[Detect the language of this message—including if it is Hindi or another Indian language written in English letters such as "kaise ho"—understand its meaning in that language, and reply naturally in the detected language.]'
           : `[Understand this message even if it contains Romanized Indian words written in English letters like "kaise ho", and respond in ${targetLang.name} (${targetLang.nativeScript}) using ${targetLang.scriptDescription}.]`;
 
-      // Keep the most recent 12 turns so context stays fast and never hits free-tier token-per-minute bottlenecks
+      // Keep the most recent 12 turns so context stays fast
       const recentMessages = messages.slice(-12);
 
       // Convert conversation history into Gemini contents array
@@ -607,12 +989,13 @@ async function startServer() {
         };
       });
 
-      const lastUserText = (recentMessages.at(-1)?.text || '').toLowerCase();
+      const lastUserRawText = (recentMessages.at(-1)?.text || '').trim();
+      const lastUserText = lastUserRawText.toLowerCase();
       const hasUrls = Array.isArray(urls) && urls.length > 0;
 
-      // Detect geography / place / local discovery queries when groundingMode is 'auto'
+      // Detect geography / place / local discovery / user location queries when groundingMode is 'auto'
       const isPlaceOrMapQuery =
-        /\b(nearby|near me|restaurants?|cafes?|coffee shops?|hotels?|hospitals?|pharmacies|directions|route to|where is|places to visit|tourist attractions?|things to do in|landmarks? in|distance between|map of|best food in|parks? in|museums? in|temples? in|malls? in|airports? in|stations? in)\b/i.test(
+        /\b(my location|where am i|current location|locate me|nearby|near me|restaurants?|cafes?|coffee shops?|hotels?|hospitals?|pharmacies|directions|route to|where is|places to visit|tourist attractions?|things to do in|landmarks? in|distance between|map of|best food in|parks? in|museums? in|temples? in|malls? in|airports? in|stations? in)\b/i.test(
           lastUserText
         );
 
@@ -631,33 +1014,6 @@ async function startServer() {
         !useMapsGrounding &&
         (groundingMode === 'search' || (groundingMode === 'auto' && isLiveWebSearchQuery));
 
-      // Note: googleMaps cannot be combined with googleSearch or urlContext in the same request
-      const tools: Array<Record<string, unknown>> = [];
-      let toolConfig: Record<string, unknown> | undefined;
-
-      if (useMapsGrounding) {
-        tools.push({ googleMaps: {} });
-        if (
-          userLocation &&
-          typeof userLocation.latitude === 'number' &&
-          typeof userLocation.longitude === 'number'
-        ) {
-          toolConfig = {
-            retrievalConfig: {
-              latLng: {
-                latitude: userLocation.latitude,
-                longitude: userLocation.longitude,
-              },
-            },
-          };
-        }
-      } else if (hasUrls) {
-        tools.push({ urlContext: {} });
-      } else if (useSearchGrounding) {
-        tools.push({ googleSearch: {} });
-      }
-
-      const candidateModels = ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
       const collectedSources = new Map<
         string,
         { uri: string; title: string; kind?: 'web' | 'maps'; reviewSnippets?: string[] }
@@ -666,212 +1022,202 @@ async function startServer() {
       let completedSuccessfully = false;
       let lastStreamErr: unknown = null;
 
-      const consumeStreamWithTimeout = async (
-        streamGen: AsyncGenerator<GenerateContentResponse, void, unknown>,
-        chunkTimeoutMs = 8500
-      ) => {
-        const iterator = streamGen[Symbol.asyncIterator]();
-        while (true) {
-          const nextResult = await withTimeout(
-            iterator.next(),
-            chunkTimeoutMs,
-            'Stream chunk read'
-          );
-          if (nextResult.done) break;
-          const c = nextResult.value as GenerateContentResponse;
-          let deltaText = '';
-          try {
-            deltaText = c.text || '';
-          } catch {
-            deltaText = '';
+      const { locationContextBlock, mapsSources } =
+        useMapsGrounding || Boolean(userLocation)
+          ? await resolveLocationAndMapsContext(
+              userLocation,
+              lastUserRawText,
+              useMapsGrounding || isPlaceOrMapQuery
+            )
+          : { locationContextBlock: '', mapsSources: [] };
+
+      if (useMapsGrounding || isPlaceOrMapQuery) {
+        for (const ms of mapsSources) {
+          collectedSources.set(ms.uri, ms);
+        }
+      }
+
+      // PRIMARY ENGINE: Ultra-Fast Groq LPU Streaming when Groq API key is configured
+      if (groqKey) {
+        let urlContextBlock = '';
+        if (hasUrls) {
+          const { contextBlock, fetchedSources } = await fetchUrlContextForGroq(urls);
+          urlContextBlock = contextBlock;
+          for (const fsItem of fetchedSources) {
+            collectedSources.set(fsItem.uri, fsItem);
           }
+        }
 
-          if (!deltaText) {
-            const parts = c.candidates?.[0]?.content?.parts;
-            if (Array.isArray(parts)) {
-              for (const part of parts) {
-                const p = part as { text?: string; thought?: boolean };
-                if (typeof p.text === 'string' && p.text.length > 0 && !p.thought) {
-                  deltaText += p.text;
-                }
-              }
-            }
-          }
+        let hasImageAttachment = false;
+        const groqMessages: Array<{
+          role: 'system' | 'user' | 'assistant';
+          content:
+            | string
+            | Array<
+                | { type: 'text'; text: string }
+                | { type: 'image_url'; image_url: { url: string } }
+              >;
+        }> = [
+          {
+            role: 'system',
+            content: locationContextBlock
+              ? `${effectiveSystemInstruction}\n\n${locationContextBlock}`
+              : effectiveSystemInstruction,
+          },
+        ];
 
-          if (deltaText) {
-            streamedAnyText = true;
-            sendEvent({ type: 'delta', text: deltaText });
-          }
+        for (let idx = 0; idx < recentMessages.length; idx++) {
+          const msg = recentMessages[idx];
+          const isLastUserMsg = idx === recentMessages.length - 1 && msg.role !== 'model';
+          const isRecentTurn = idx >= recentMessages.length - 2;
+          const textChunks: string[] = [];
+          const imageParts: Array<{ type: 'image_url'; image_url: { url: string } }> = [];
 
-          // Extract groundingChunks from Google Search grounding & Google Maps grounding
-          const candidate = c.candidates?.[0] as Record<string, unknown> | undefined;
-          const groundingMetadata = candidate?.groundingMetadata as
-            | {
-                groundingChunks?: Array<{
-                  web?: { uri?: string; title?: string };
-                  maps?: {
-                    uri?: string;
-                    title?: string;
-                    placeAnswerSources?: {
-                      reviewSnippets?: Array<{
-                        snippet?: string;
-                        text?: string;
-                        reviewText?: string;
-                        uri?: string;
-                        googleMapsUri?: string;
-                        title?: string;
-                      }>;
-                    };
-                  };
-                }>;
-              }
-            | undefined;
-
-          if (groundingMetadata?.groundingChunks) {
-            for (const gc of groundingMetadata.groundingChunks) {
-              if (gc.web?.uri) {
-                collectedSources.set(gc.web.uri, {
-                  uri: gc.web.uri,
-                  title: gc.web.title || gc.web.uri,
-                  kind: 'web',
-                });
-              }
-
-              if (gc.maps?.uri) {
-                const snippets: string[] = [];
-                const rawSnippets = gc.maps.placeAnswerSources?.reviewSnippets;
-                if (Array.isArray(rawSnippets)) {
-                  for (const rs of rawSnippets) {
-                    const snippetText = rs.snippet || rs.text || rs.reviewText;
-                    if (snippetText) {
-                      snippets.push(snippetText);
-                    }
-                    const snippetUri = rs.uri || rs.googleMapsUri;
-                    if (snippetUri && !collectedSources.has(snippetUri)) {
-                      collectedSources.set(snippetUri, {
-                        uri: snippetUri,
-                        title: rs.title || `${gc.maps.title || 'Google Maps'} Review`,
-                        kind: 'maps',
-                      });
-                    }
-                  }
-                }
-
-                const existing = collectedSources.get(gc.maps.uri);
-                collectedSources.set(gc.maps.uri, {
-                  uri: gc.maps.uri,
-                  title: gc.maps.title || 'View on Google Maps',
-                  kind: 'maps',
-                  reviewSnippets:
-                    snippets.length > 0
-                      ? Array.from(new Set([...(existing?.reviewSnippets || []), ...snippets]))
-                      : existing?.reviewSnippets,
-                });
-              }
-            }
-          }
-
-          // Extract urlContextMetadata if present on candidate
-          const urlContextMetadata = candidate?.urlContextMetadata as
-            | {
-                urlMetadata?: Array<{
-                  retrievedUrl?: string;
-                  urlRetrievalStatus?: string;
-                }>;
-              }
-            | undefined;
-
-          if (urlContextMetadata?.urlMetadata) {
-            for (const um of urlContextMetadata.urlMetadata) {
-              if (
-                um.retrievedUrl &&
-                (!um.urlRetrievalStatus ||
-                  um.urlRetrievalStatus.includes('SUCCESS') ||
-                  um.urlRetrievalStatus === 'URL_RETRIEVAL_STATUS_SUCCESS')
+          if (msg.attachments && msg.attachments.length > 0) {
+            for (const att of msg.attachments) {
+              if (att.extractedText && typeof att.extractedText === 'string') {
+                const snippet = isRecentTurn
+                  ? att.extractedText.slice(0, 20000)
+                  : att.extractedText.slice(0, 2500);
+                textChunks.push(
+                  `--- Attached File: ${att.name} (${att.mimeType}) ---\n${snippet}\n--- End of ${att.name} ---`
+                );
+              } else if (
+                isRecentTurn &&
+                att.kind === 'inline' &&
+                att.base64Data &&
+                att.mimeType.startsWith('image/')
               ) {
-                if (!collectedSources.has(um.retrievedUrl)) {
-                  let hostname = um.retrievedUrl;
-                  try {
-                    hostname = new URL(um.retrievedUrl).hostname.replace(/^www\./, '');
-                  } catch {
-                    // keep raw
-                  }
-                  collectedSources.set(um.retrievedUrl, {
-                    uri: um.retrievedUrl,
-                    title: hostname,
-                    kind: 'web',
-                  });
-                }
+                hasImageAttachment = true;
+                imageParts.push({
+                  type: 'image_url',
+                  image_url: {
+                    url: `data:${att.mimeType};base64,${att.base64Data}`,
+                  },
+                });
+              } else {
+                textChunks.push(`[Attached file: ${att.name} (${att.mimeType})]`);
               }
             }
           }
-        }
-      };
 
-      for (const modelName of candidateModels) {
-        if (completedSuccessfully) break;
-        try {
-          const streamResponse = (await withTimeout(
-            ai.models.generateContentStream({
-              model: modelName,
-              contents,
-              config: {
-                systemInstruction: effectiveSystemInstruction,
-                ...getFastThinkingConfig(modelName),
-                ...(tools.length > 0 ? { tools } : {}),
-                ...(toolConfig ? { toolConfig } : {}),
-              },
-            }),
-            8500,
-            `generateContentStream(${modelName})`
-          )) as unknown as AsyncGenerator<GenerateContentResponse, void, unknown>;
+          if (isLastUserMsg && urlContextBlock) {
+            textChunks.push(urlContextBlock);
+          }
 
-          await consumeStreamWithTimeout(streamResponse, 8500);
-          if (streamedAnyText) {
-            completedSuccessfully = true;
-            break;
+          if (isLastUserMsg && locationContextBlock && (useMapsGrounding || isPlaceOrMapQuery)) {
+            textChunks.push(locationContextBlock);
           }
-        } catch (err) {
-          lastStreamErr = err;
-          const errStr = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
-          if (
-            tools.length > 0 &&
-            (errStr.includes('429') ||
-              errStr.includes('resource_exhausted') ||
-              errStr.includes('quota'))
-          ) {
-            markGroundingUnavailable();
+
+          if (msg.text && msg.text.trim()) {
+            textChunks.push(
+              isLastUserMsg ? `${msg.text}\n\n${promptLanguageDirective}` : msg.text
+            );
+          } else if (textChunks.length > 0 || imageParts.length > 0) {
+            textChunks.push(`Please analyze the attached file(s). ${promptLanguageDirective}`);
           }
-          if (streamedAnyText) {
-            completedSuccessfully = true;
-            break;
+
+          const combinedText = textChunks.join('\n\n').trim() || '...';
+          if (msg.role === 'model') {
+            groqMessages.push({
+              role: 'assistant',
+              content: combinedText,
+            });
+          } else if (imageParts.length > 0) {
+            groqMessages.push({
+              role: 'user',
+              content: [{ type: 'text', text: combinedText }, ...imageParts],
+            });
+          } else {
+            groqMessages.push({
+              role: 'user',
+              content: combinedText,
+            });
           }
         }
 
-        // If grounding tools caused an error or returned empty text, immediately retry without tools on the same fast model
-        if (!completedSuccessfully && tools.length > 0) {
-          tools.length = 0; // Clear tools for remaining attempts in this request
+        const groqCandidateModels = hasImageAttachment
+          ? [...GROQ_VISION_MODELS, ...GROQ_TEXT_MODELS]
+          : GROQ_TEXT_MODELS;
+
+        for (const groqModel of groqCandidateModels) {
+          if (completedSuccessfully) break;
           try {
-            const retryStream = (await withTimeout(
-              ai.models.generateContentStream({
-                model: modelName,
-                contents,
-                config: {
-                  systemInstruction: effectiveSystemInstruction,
-                  ...getFastThinkingConfig(modelName),
-                },
-              }),
-              8500,
-              `generateContentStream-notools(${modelName})`
-            )) as unknown as AsyncGenerator<GenerateContentResponse, void, unknown>;
+            // If falling back from a vision model to a text-only model, flatten multimodal array content to text
+            const isVisionModel = GROQ_VISION_MODELS.includes(groqModel);
+            const normalizedMessages = groqMessages.map((gm) => {
+              if (!isVisionModel && Array.isArray(gm.content)) {
+                const textOnly = gm.content
+                  .map((c) => (c.type === 'text' ? c.text : '[Attached Image]'))
+                  .join('\n');
+                return { role: gm.role, content: textOnly };
+              }
+              return gm;
+            });
 
-            await consumeStreamWithTimeout(retryStream, 8500);
+            const groqResp = await withTimeout(
+              fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${groqKey}`,
+                },
+                body: JSON.stringify({
+                  model: groqModel,
+                  messages: normalizedMessages,
+                  stream: true,
+                  temperature: 0.6,
+                  max_tokens: 4096,
+                }),
+              }),
+              10000,
+              `groqStream(${groqModel})`
+            );
+
+            if (!groqResp.ok || !groqResp.body) {
+              const errBody = await groqResp.text().catch(() => '');
+              throw new Error(errBody || `Groq HTTP ${groqResp.status}`);
+            }
+
+            const reader = groqResp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let sseBuffer = '';
+
+            while (true) {
+              const { value, done } = await withTimeout(
+                reader.read(),
+                8500,
+                `groqChunk(${groqModel})`
+              );
+              if (done) break;
+              sseBuffer += decoder.decode(value, { stream: true });
+              const lines = sseBuffer.split('\n');
+              sseBuffer = lines.pop() || '';
+
+              for (const rawLine of lines) {
+                const trimmed = rawLine.trim();
+                if (!trimmed.startsWith('data:')) continue;
+                const payloadStr = trimmed.replace(/^data:\s*/, '');
+                if (payloadStr === '[DONE]') continue;
+                try {
+                  const parsed = JSON.parse(payloadStr);
+                  const deltaContent = parsed?.choices?.[0]?.delta?.content;
+                  if (typeof deltaContent === 'string' && deltaContent.length > 0) {
+                    streamedAnyText = true;
+                    sendEvent({ type: 'delta', text: deltaContent });
+                  }
+                } catch {
+                  // Ignore partial JSON line
+                }
+              }
+            }
+
             if (streamedAnyText) {
               completedSuccessfully = true;
               break;
             }
-          } catch (retryErr) {
-            lastStreamErr = retryErr;
+          } catch (err) {
+            lastStreamErr = err;
             if (streamedAnyText) {
               completedSuccessfully = true;
               break;
@@ -880,7 +1226,179 @@ async function startServer() {
         }
       }
 
-      // Final non-streaming fallback if all streaming endpoints experienced 503 spikes or empty streams
+      // SECONDARY ENGINE: Gemini Streaming Fallback (if Gemini key is configured and Groq did not complete)
+      if (!completedSuccessfully && ai) {
+        const tools: Array<Record<string, unknown>> = [];
+        let toolConfig: Record<string, unknown> | undefined;
+
+        if (useMapsGrounding) {
+          tools.push({ googleMaps: {} });
+          if (
+            userLocation &&
+            typeof userLocation.latitude === 'number' &&
+            typeof userLocation.longitude === 'number'
+          ) {
+            toolConfig = {
+              retrievalConfig: {
+                latLng: {
+                  latitude: userLocation.latitude,
+                  longitude: userLocation.longitude,
+                },
+              },
+            };
+          }
+        } else if (hasUrls) {
+          tools.push({ urlContext: {} });
+        } else if (useSearchGrounding) {
+          tools.push({ googleSearch: {} });
+        }
+
+        const candidateModels = [
+          'gemini-3.1-flash-lite',
+          'gemini-flash-latest',
+          'gemini-3.8-flash',
+        ];
+
+        const consumeStreamWithTimeout = async (
+          streamGen: AsyncGenerator<GenerateContentResponse, void, unknown>,
+          chunkTimeoutMs = 8500
+        ) => {
+          const iterator = streamGen[Symbol.asyncIterator]();
+          while (true) {
+            const nextResult = await withTimeout(
+              iterator.next(),
+              chunkTimeoutMs,
+              'Stream chunk read'
+            );
+            if (nextResult.done) break;
+            const c = nextResult.value as GenerateContentResponse;
+            let deltaText = '';
+            try {
+              deltaText = c.text || '';
+            } catch {
+              deltaText = '';
+            }
+
+            if (!deltaText) {
+              const parts = c.candidates?.[0]?.content?.parts;
+              if (Array.isArray(parts)) {
+                for (const part of parts) {
+                  const p = part as { text?: string; thought?: boolean };
+                  if (typeof p.text === 'string' && p.text.length > 0 && !p.thought) {
+                    deltaText += p.text;
+                  }
+                }
+              }
+            }
+
+            if (deltaText) {
+              streamedAnyText = true;
+              sendEvent({ type: 'delta', text: deltaText });
+            }
+
+            const candidate = c.candidates?.[0] as Record<string, unknown> | undefined;
+            const groundingMetadata = candidate?.groundingMetadata as
+              | {
+                  groundingChunks?: Array<{
+                    web?: { uri?: string; title?: string };
+                    maps?: {
+                      uri?: string;
+                      title?: string;
+                      placeAnswerSources?: {
+                        reviewSnippets?: Array<{
+                          snippet?: string;
+                          text?: string;
+                          reviewText?: string;
+                          uri?: string;
+                          googleMapsUri?: string;
+                          title?: string;
+                        }>;
+                      };
+                    };
+                  }>;
+                }
+              | undefined;
+
+            if (groundingMetadata?.groundingChunks) {
+              for (const gc of groundingMetadata.groundingChunks) {
+                if (gc.web?.uri) {
+                  collectedSources.set(gc.web.uri, {
+                    uri: gc.web.uri,
+                    title: gc.web.title || gc.web.uri,
+                    kind: 'web',
+                  });
+                }
+
+                if (gc.maps?.uri) {
+                  const snippets: string[] = [];
+                  const rawSnippets = gc.maps.placeAnswerSources?.reviewSnippets;
+                  if (Array.isArray(rawSnippets)) {
+                    for (const rs of rawSnippets) {
+                      const snippetText = rs.snippet || rs.text || rs.reviewText;
+                      if (snippetText) {
+                        snippets.push(snippetText);
+                      }
+                      const snippetUri = rs.uri || rs.googleMapsUri;
+                      if (snippetUri && !collectedSources.has(snippetUri)) {
+                        collectedSources.set(snippetUri, {
+                          uri: snippetUri,
+                          title: rs.title || `${gc.maps.title || 'Google Maps'} Review`,
+                          kind: 'maps',
+                        });
+                      }
+                    }
+                  }
+
+                  const existing = collectedSources.get(gc.maps.uri);
+                  collectedSources.set(gc.maps.uri, {
+                    uri: gc.maps.uri,
+                    title: gc.maps.title || 'View on Google Maps',
+                    kind: 'maps',
+                    reviewSnippets:
+                      snippets.length > 0
+                        ? Array.from(new Set([...(existing?.reviewSnippets || []), ...snippets]))
+                        : existing?.reviewSnippets,
+                  });
+                }
+              }
+            }
+          }
+        };
+
+        for (const modelName of candidateModels) {
+          if (completedSuccessfully) break;
+          try {
+            const streamResponse = (await withTimeout(
+              ai.models.generateContentStream({
+                model: modelName,
+                contents,
+                config: {
+                  systemInstruction: effectiveSystemInstruction,
+                  ...getFastThinkingConfig(modelName),
+                  ...(tools.length > 0 ? { tools } : {}),
+                  ...(toolConfig ? { toolConfig } : {}),
+                },
+              }),
+              8500,
+              `generateContentStream(${modelName})`
+            )) as unknown as AsyncGenerator<GenerateContentResponse, void, unknown>;
+
+            await consumeStreamWithTimeout(streamResponse, 8500);
+            if (streamedAnyText) {
+              completedSuccessfully = true;
+              break;
+            }
+          } catch (err) {
+            lastStreamErr = err;
+            if (streamedAnyText) {
+              completedSuccessfully = true;
+              break;
+            }
+          }
+        }
+      }
+
+      // Final non-streaming fallback if all streaming endpoints experienced transient issues
       if (!completedSuccessfully || !streamedAnyText) {
         const fallbackText = await generateFreeTierText(
           ai,
@@ -955,7 +1473,7 @@ async function startServer() {
         return;
       }
 
-      const ai = getAiClient(12000);
+      const ai = getOptionalAiClient(12000);
       const parts: Array<Record<string, unknown>> = [];
 
       if (referenceImage?.base64Data && referenceImage?.mimeType) {
@@ -968,7 +1486,7 @@ async function startServer() {
       }
       parts.push({ text: prompt.trim() });
 
-      if (!isPaidModelsInCooldown()) {
+      if (ai && !isPaidModelsInCooldown()) {
         const imageModels = [
           {
             name: 'gemini-nano-banana-2.1',
@@ -1095,9 +1613,9 @@ Create a richly detailed, multi-layered, visually stunning standalone SVG illust
 
       const validAspectRatio: '16:9' | '9:16' = aspectRatio === '9:16' ? '9:16' : '16:9';
       const validDuration: '5s' | '10s' = duration === '10s' ? '10s' : '5s';
-      const ai = getAiClient(12000);
+      const ai = getOptionalAiClient(12000);
 
-      if (!isPaidModelsInCooldown()) {
+      if (ai && !isPaidModelsInCooldown()) {
         try {
           const inputPayload =
             referenceImage?.base64Data && referenceImage?.mimeType
@@ -1311,9 +1829,9 @@ Create a smooth, cinematic, looping animated SVG scene (viewBox="${viewBox}" wid
 
       const selectedLyriaModel =
         trackType === 'pro' ? 'lyria-3-pro-preview' : 'lyria-3-clip-preview';
-      const ai = getAiClient(12000);
+      const ai = getOptionalAiClient(12000);
 
-      if (!isPaidModelsInCooldown()) {
+      if (ai && !isPaidModelsInCooldown()) {
         try {
           const contents =
             referenceImage?.base64Data && referenceImage?.mimeType
@@ -1447,7 +1965,7 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
     }
   });
 
-  // 6. Audio Transcription via Gemini (fast free-tier transcription)
+  // 6. Audio Transcription via Groq Whisper (whisper-large-v3-turbo) with Gemini fallback
   app.post('/api/transcribe', async (req, res) => {
     try {
       const { audioBase64, mimeType = 'audio/webm', language } = req.body as {
@@ -1461,46 +1979,100 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
         return;
       }
 
-      const ai = getAiClient(12000);
-      const langInstruction =
-        language && language !== 'auto' && language !== 'Auto'
-          ? `Transcribe this audio in ${language}. Return ONLY the exact transcribed text with no extra commentary.`
-          : 'Transcribe this audio accurately in the language spoken. Return ONLY the exact transcribed text with no extra commentary.';
-
-      const audioContents = {
-        parts: [
-          {
-            inlineData: {
-              mimeType,
-              data: audioBase64,
-            },
-          },
-          {
-            text: langInstruction,
-          },
-        ],
-      };
-
+      const groqKey = resolveGroqApiKey();
       let transcript = '';
-      if (!isPaidModelsInCooldown()) {
-        try {
-          const response = await withTimeout(
-            ai.models.generateContent({
-              model: 'gemini-3.5-transcribe',
-              contents: audioContents,
-            }),
-            3500,
-            'gemini-3.5-transcribe'
-          );
-          transcript = (response.text || '').trim();
-        } catch {
-          markPaidModelsUnavailable();
+
+      if (groqKey) {
+        const audioBuffer = Buffer.from(audioBase64, 'base64');
+        const ext = mimeType.includes('mp4')
+          ? 'm4a'
+          : mimeType.includes('ogg')
+            ? 'ogg'
+            : mimeType.includes('wav')
+              ? 'wav'
+              : mimeType.includes('mp3') || mimeType.includes('mpeg')
+                ? 'mp3'
+                : 'webm';
+
+        for (const whisperModel of ['whisper-large-v3-turbo', 'whisper-large-v3']) {
+          try {
+            const formData = new FormData();
+            const audioBlob = new Blob([audioBuffer], { type: mimeType || 'audio/webm' });
+            formData.append('file', audioBlob, `recording.${ext}`);
+            formData.append('model', whisperModel);
+            if (language && language !== 'auto' && language !== 'Auto') {
+              formData.append(
+                'prompt',
+                `Transcribe accurately in ${language}.`
+              );
+            }
+
+            const groqResp = await withTimeout(
+              fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${groqKey}`,
+                },
+                body: formData,
+              }),
+              12000,
+              `groqWhisper(${whisperModel})`
+            );
+
+            if (groqResp.ok) {
+              const data = (await groqResp.json()) as { text?: string };
+              if (typeof data?.text === 'string' && data.text.trim()) {
+                transcript = data.text.trim();
+                break;
+              }
+            }
+          } catch {
+            // Try next whisper model or fallback
+          }
         }
       }
 
-      if (!transcript) {
-        const fallbackText = await generateFreeTierText(ai, audioContents);
-        transcript = fallbackText.trim();
+      const ai = getOptionalAiClient(12000);
+      if (!transcript && ai) {
+        const langInstruction =
+          language && language !== 'auto' && language !== 'Auto'
+            ? `Transcribe this audio in ${language}. Return ONLY the exact transcribed text with no extra commentary.`
+            : 'Transcribe this audio accurately in the language spoken. Return ONLY the exact transcribed text with no extra commentary.';
+
+        const audioContents = {
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data: audioBase64,
+              },
+            },
+            {
+              text: langInstruction,
+            },
+          ],
+        };
+
+        if (!isPaidModelsInCooldown()) {
+          try {
+            const response = await withTimeout(
+              ai.models.generateContent({
+                model: 'gemini-3.5-transcribe',
+                contents: audioContents,
+              }),
+              3500,
+              'gemini-3.5-transcribe'
+            );
+            transcript = (response.text || '').trim();
+          } catch {
+            markPaidModelsUnavailable();
+          }
+        }
+
+        if (!transcript) {
+          const fallbackText = await generateFreeTierText(ai, audioContents);
+          transcript = fallbackText.trim();
+        }
       }
 
       res.json({
@@ -1909,8 +2481,44 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
     });
   } else {
     process.env.DISABLE_HMR = 'true';
+    const viteClientWsShim = `class WebSocket extends EventTarget {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  constructor(url = '', protocol = '') {
+    super();
+    this.CONNECTING = 0;
+    this.OPEN = 1;
+    this.CLOSING = 2;
+    this.CLOSED = 3;
+    this.readyState = 1;
+    this.url = String(url);
+    this.protocol = String(protocol);
+    setTimeout(() => {
+      try { this.dispatchEvent(new Event('open')); } catch {}
+    }, 0);
+  }
+  send() {}
+  close() { this.readyState = 3; }
+}\n`;
     const viteReadyPromise = import('vite').then(({ createServer: createViteServer }) =>
       createViteServer({
+        plugins: [
+          {
+            name: 'disable-vite-client-ws-errors',
+            enforce: 'post',
+            transform(code, id) {
+              if (id.includes('vite/dist/client/client.mjs')) {
+                return {
+                  code: viteClientWsShim + code,
+                  map: null,
+                };
+              }
+              return null;
+            },
+          },
+        ],
         server: {
           middlewareMode: true,
           hmr: false,

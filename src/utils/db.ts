@@ -178,13 +178,40 @@ async function putLocalSession(session: ChatSession): Promise<void> {
   }
 }
 
+async function clearGuestSessionsFromLocalDb(): Promise<void> {
+  try {
+    const db = await openDatabase();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_SESSIONS, 'readwrite');
+      const store = tx.objectStore(STORE_SESSIONS);
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const all = (req.result as ChatSession[]) || [];
+        for (const s of all) {
+          const owner = (s.userEmail || 'guest').trim().toLowerCase();
+          if (owner === 'guest') {
+            store.delete(s.id);
+          }
+        }
+        resolve();
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    // ignore cleanup error
+  }
+}
+
 export async function getAllSessions(userEmail?: string): Promise<ChatSession[]> {
   const normalizedEmail = (userEmail || 'guest').trim().toLowerCase();
-  const localSessions = await getLocalSessionsByEmail(normalizedEmail);
 
+  // Guest users (not logged in) never persist or reload previous chat history across page loads
   if (normalizedEmail === 'guest') {
-    return localSessions;
+    await clearGuestSessionsFromLocalDb();
+    return [];
   }
+
+  const localSessions = await getLocalSessionsByEmail(normalizedEmail);
 
   // Merge local IndexedDB sessions with server-persisted and Firestore sessions for this email
   const mergedMap = new Map<string, ChatSession>();
@@ -275,6 +302,12 @@ export async function saveSession(
   userEmail?: string
 ): Promise<void> {
   const normalizedEmail = (userEmail || session.userEmail || 'guest').trim().toLowerCase();
+
+  // Do not save chat history for unauthenticated guest users
+  if (normalizedEmail === 'guest') {
+    return;
+  }
+
   const taggedSession: ChatSession = {
     ...session,
     userEmail: normalizedEmail,

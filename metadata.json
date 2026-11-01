@@ -2,7 +2,8 @@
   "name": "Mantrana AI",
   "description": "Multimodal AI workspace for chat, document and media understanding, link reading, voice input, and image, video, and music generation.",
   "requestFramePermissions": [
-    "microphone"
+    "microphone",
+    "geolocation"
   ],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
