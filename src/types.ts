@@ -137,6 +137,8 @@ export interface ChatSession {
   updatedAt: number;
   messages: ChatMessage[];
   userEmail?: string;
+  pinned?: boolean;
+  pinnedAt?: number;
 }
 
 export interface UserAccount {

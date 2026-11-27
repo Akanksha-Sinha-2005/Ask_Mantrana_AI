@@ -720,6 +720,17 @@ export default function App() {
     [updateSessionState]
   );
 
+  const handleTogglePinSession = useCallback(
+    (id: string) => {
+      updateSessionState(id, (s) => ({
+        ...s,
+        pinned: !s.pinned,
+        pinnedAt: !s.pinned ? Date.now() : undefined,
+      }));
+    },
+    [updateSessionState]
+  );
+
   const handleDeleteSession = useCallback(
     async (id: string) => {
       const activeEmail = userAccount?.email || 'guest';
@@ -2090,6 +2101,7 @@ export default function App() {
           onNewChat={handleNewChat}
           onRenameSession={handleRenameSession}
           onDeleteSession={handleDeleteSession}
+          onTogglePinSession={handleTogglePinSession}
           quickActions={welcomeSuggestions}
           userAccount={userAccount}
           onOpenAuthModal={() => setIsAuthModalOpen(true)}
@@ -2132,15 +2144,6 @@ export default function App() {
                   <PanelLeft className="w-4 h-4" />
                 </button>
               )}
-
-              <button
-                type="button"
-                onClick={handleNewChat}
-                title="Start a new chat (Ctrl+N)"
-                className="text-base sm:text-lg font-bold tracking-tight font-display text-slate-900 dark:text-white whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                Mαɳƚɾαɳα AI ✨
-              </button>
             </div>
 
 

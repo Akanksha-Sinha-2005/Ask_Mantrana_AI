@@ -417,10 +417,16 @@ CORE RULES:
    - Fenced code blocks with an explicit language tag (e.g., \`\`\`typescript, \`\`\`python, \`\`\`sql) for all code snippets.
    - Standard LaTeX math notation ($...$ for inline math, $$...$$ for block equations) when mathematical formulas are needed.
 ${languageRule}
-3. Strict Grounding & Honesty:
-   - Base your answers strictly on the user's input, attached files, and grounded URL/search tool results.
+3. Strict Grounding, Live Web Search & Honesty:
+   - Base your answers strictly on the user's input, attached files, and grounded URL/live web search results.
+   - When [LIVE WEB SEARCH RESULTS] are provided in the context, synthesize the most up-to-date facts, dates, figures, and developments accurately and naturally without mentioning internal system tags.
    - NEVER claim to have read a file or web link that was not actually provided and processed.
-   - If a URL provided by the user could not be accessed or its content could not be retrieved by the URL context tool, state clearly and honestly that the page could not be read.`;
+   - If a URL provided by the user could not be accessed or its content could not be retrieved by the URL context tool, state clearly and honestly that the page could not be read.
+4. Built-in Coding Assistance (Write, Explain, Debug, and Improve Code):
+   - Writing Code: Write clean, complete, production-ready, and idiomatic code with proper error handling, type safety, and clear comments where helpful. Do not leave broken placeholders or incomplete stubs unless explicitly asked.
+   - Explaining Code: Break down complex logic, control flow, data structures, and time/space complexity clearly and step-by-step so the user understands both what the code does and why.
+   - Debugging Code: Identify the exact root cause of compiler errors, runtime exceptions, or logical bugs, explain why the bug occurs, and provide the corrected, working code.
+   - Improving & Refactoring Code: Proactively improve code readability, modularity, security, and performance while preserving intended behavior.`;
 }
 
 const SYSTEM_INSTRUCTION = buildSystemInstructionForLanguage('Auto');
@@ -581,6 +587,212 @@ async function fetchUrlContextForGroq(
   return {
     contextBlock: snippets.join('\n\n'),
     fetchedSources,
+  };
+}
+
+function decodeHtmlEntities(raw: string): string {
+  return raw
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#(\d+);/g, (_m, code) => {
+      const n = Number(code);
+      return Number.isFinite(n) ? String.fromCharCode(n) : '';
+    });
+}
+
+async function performLiveWebSearchForGroq(
+  rawQuery: string
+): Promise<{
+  searchContextBlock: string;
+  searchSources: Array<{ uri: string; title: string; kind: 'web' }>;
+}> {
+  const cleanedQuery = rawQuery
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 220);
+
+  if (!cleanedQuery || cleanedQuery.length < 2) {
+    return { searchContextBlock: '', searchSources: [] };
+  }
+
+  const searchSources: Array<{ uri: string; title: string; kind: 'web' }> = [];
+  const seenUris = new Set<string>();
+  const snippets: string[] = [];
+
+  const addSource = (uri: string, title: string) => {
+    if (!uri || !/^https?:\/\//i.test(uri) || seenUris.has(uri)) return;
+    seenUris.add(uri);
+    searchSources.push({
+      uri,
+      title: (title || uri).slice(0, 120),
+      kind: 'web',
+    });
+  };
+
+  // 1. DuckDuckGo HTML Search (broad live web results)
+  const ddgHtmlTask = (async () => {
+    try {
+      const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(cleanedQuery)}`;
+      const resp = await withTimeout(
+        fetch(ddgUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept: 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        }),
+        3500,
+        'ddgHtmlSearch'
+      );
+      if (!resp.ok) return;
+      const html = await resp.text();
+
+      const resultBlocks = html.split(/class="result__body"/i).slice(1, 7);
+      for (const block of resultBlocks) {
+        const linkMatch = block.match(
+          /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i
+        );
+        if (!linkMatch) continue;
+
+        let targetUrl = decodeHtmlEntities(linkMatch[1].trim());
+        const uddgMatch = targetUrl.match(/[?&]uddg=([^&]+)/i);
+        if (uddgMatch?.[1]) {
+          try {
+            targetUrl = decodeURIComponent(uddgMatch[1]);
+          } catch {
+            // keep original
+          }
+        } else if (targetUrl.startsWith('//')) {
+          targetUrl = `https:${targetUrl}`;
+        }
+
+        const title = decodeHtmlEntities(linkMatch[2].replace(/<[^>]+>/g, ' '))
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        const snippetMatch = block.match(
+          /class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div|span)>/i
+        );
+        const snippetText = snippetMatch
+          ? decodeHtmlEntities(snippetMatch[1].replace(/<[^>]+>/g, ' '))
+              .replace(/\s+/g, ' ')
+              .trim()
+          : '';
+
+        if (/^https?:\/\//i.test(targetUrl) && title) {
+          addSource(targetUrl, title);
+          if (snippetText) {
+            snippets.push(`- [${title}](${targetUrl}): ${snippetText}`);
+          }
+        }
+      }
+    } catch {
+      // Ignore DDG HTML failure
+    }
+  })();
+
+  // 2. DuckDuckGo Instant Answer API
+  const ddgInstantTask = (async () => {
+    try {
+      const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(
+        cleanedQuery
+      )}&format=json&no_html=1&skip_disambig=1`;
+      const resp = await withTimeout(fetch(apiUrl), 2800, 'ddgInstantAnswer');
+      if (!resp.ok) return;
+      const data = (await resp.json()) as any;
+
+      if (typeof data?.Answer === 'string' && data.Answer.trim()) {
+        snippets.unshift(`- Instant Answer: ${data.Answer.trim()}`);
+      }
+      if (typeof data?.AbstractText === 'string' && data.AbstractText.trim()) {
+        const absUrl =
+          typeof data?.AbstractURL === 'string' && data.AbstractURL.trim()
+            ? data.AbstractURL.trim()
+            : '';
+        const absTitle =
+          typeof data?.Heading === 'string' && data.Heading.trim()
+            ? data.Heading.trim()
+            : cleanedQuery;
+        if (absUrl) addSource(absUrl, absTitle);
+        snippets.push(
+          `- ${absTitle}${absUrl ? ` (${absUrl})` : ''}: ${data.AbstractText.trim()}`
+        );
+      }
+      if (Array.isArray(data?.RelatedTopics)) {
+        for (const topic of data.RelatedTopics.slice(0, 3)) {
+          if (typeof topic?.Text === 'string' && topic.Text.trim()) {
+            const topicUrl =
+              typeof topic?.FirstURL === 'string' ? topic.FirstURL.trim() : '';
+            if (topicUrl) addSource(topicUrl, topic.Text.slice(0, 80));
+            snippets.push(`- ${topic.Text.trim()}`);
+          }
+        }
+      }
+    } catch {
+      // Ignore DDG Instant Answer failure
+    }
+  })();
+
+  // 3. Wikipedia Live Search API (up-to-date encyclopedic & current event articles)
+  const wikiTask = (async () => {
+    try {
+      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+        cleanedQuery
+      )}&utf8=1&format=json&srlimit=3`;
+      const resp = await withTimeout(
+        fetch(wikiUrl, {
+          headers: {
+            'User-Agent': 'MantranaAI/1.0 (https://aistudio.google.com)',
+          },
+        }),
+        2800,
+        'wikipediaSearch'
+      );
+      if (!resp.ok) return;
+      const data = (await resp.json()) as any;
+      const results = Array.isArray(data?.query?.search) ? data.query.search : [];
+      for (const item of results.slice(0, 3)) {
+        const title = typeof item?.title === 'string' ? item.title.trim() : '';
+        const rawSnippet = typeof item?.snippet === 'string' ? item.snippet : '';
+        const cleanSnippet = decodeHtmlEntities(rawSnippet.replace(/<[^>]+>/g, ' '))
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (title && cleanSnippet) {
+          const articleUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(
+            title.replace(/ /g, '_')
+          )}`;
+          addSource(articleUrl, `${title} — Wikipedia`);
+          snippets.push(`- [${title} — Wikipedia](${articleUrl}): ${cleanSnippet}`);
+        }
+      }
+    } catch {
+      // Ignore Wikipedia failure
+    }
+  })();
+
+  await Promise.allSettled([ddgHtmlTask, ddgInstantTask, wikiTask]);
+
+  if (snippets.length === 0) {
+    return { searchContextBlock: '', searchSources };
+  }
+
+  const todayIso = new Date().toISOString().split('T')[0];
+  const searchContextBlock = [
+    `[LIVE WEB SEARCH RESULTS — Retrieved on ${todayIso} for query: "${cleanedQuery}"]`,
+    ...snippets.slice(0, 10),
+    `[Use the live web search information above when relevant to provide accurate, up-to-date facts.]`,
+  ].join('\n');
+
+  return {
+    searchContextBlock,
+    searchSources: searchSources.slice(0, 6),
   };
 }
 
@@ -1005,8 +1217,13 @@ async function startServer() {
         (groundingMode === 'maps' || (groundingMode === 'auto' && isPlaceOrMapQuery));
 
       const isLiveWebSearchQuery =
-        /\b(latest|current|today|tonight|yesterday|breaking|news|weather|forecast|price of|stock|crypto|bitcoin|score|match|standings|schedule|2025|2026|who won|who is the current|release date|search for|look up|check online)\b/i.test(
+        /\b(latest|current|today|tonight|yesterday|recent|recently|now|update|updates|breaking|news|weather|forecast|price of|stock|crypto|bitcoin|market|score|match|standings|schedule|tournament|2024|2025|2026|2027|who won|who is the|what is the latest|release date|version|announced|launch|launched|search|look up|find out|online|internet|web|fact check|president|prime minister|ceo of|population of|capital of|exchange rate|currency|events? in|happening)\b/i.test(
           lastUserText
+        );
+
+      const isCodingAssistanceQuery =
+        /```|\b(code|coding|program|programming|function|class|method|bug|debug|debugging|error|exception|stack trace|traceback|syntax|compile|compiler|refactor|optimize|algorithm|data structure|typescript|javascript|python|java|c\+\+|c#|rust|golang|sql|html|css|react|nextjs|node|express|api|regex|dockerfile|bash|shell|git|leetcode|time complexity|write a script|implement|fix this)\b/i.test(
+          lastUserRawText
         );
 
       const useSearchGrounding =
@@ -1037,6 +1254,10 @@ async function startServer() {
         }
       }
 
+      const codingDirectiveBlock = isCodingAssistanceQuery
+        ? `\n\n[CODING ASSISTANCE MODE ACTIVE]\nThe user is asking a programming or software engineering question. Provide expert coding assistance:\n- If writing code: output clean, complete, well-structured, runnable code inside fenced code blocks with the language tag, handling edge cases and best practices.\n- If explaining code: explain the logic, flow, and key constructs clearly step-by-step.\n- If debugging: pinpoint the exact bug or error root cause, explain why it happens, and provide the fixed code.\n- If improving/refactoring: enhance performance, readability, type-safety, and maintainability.`
+        : '';
+
       // PRIMARY ENGINE: Ultra-Fast Groq LPU Streaming when Groq API key is configured
       if (groqKey) {
         let urlContextBlock = '';
@@ -1048,7 +1269,22 @@ async function startServer() {
           }
         }
 
+        let liveSearchContextBlock = '';
+        if (useSearchGrounding && lastUserRawText) {
+          const { searchContextBlock, searchSources } =
+            await performLiveWebSearchForGroq(lastUserRawText);
+          liveSearchContextBlock = searchContextBlock;
+          for (const ssItem of searchSources) {
+            collectedSources.set(ssItem.uri, ssItem);
+          }
+        }
+
         let hasImageAttachment = false;
+        const systemParts = [effectiveSystemInstruction];
+        if (codingDirectiveBlock) systemParts.push(codingDirectiveBlock.trim());
+        if (locationContextBlock) systemParts.push(locationContextBlock);
+        if (liveSearchContextBlock) systemParts.push(liveSearchContextBlock);
+
         const groqMessages: Array<{
           role: 'system' | 'user' | 'assistant';
           content:
@@ -1060,9 +1296,7 @@ async function startServer() {
         }> = [
           {
             role: 'system',
-            content: locationContextBlock
-              ? `${effectiveSystemInstruction}\n\n${locationContextBlock}`
-              : effectiveSystemInstruction,
+            content: systemParts.join('\n\n'),
           },
         ];
 
@@ -1103,6 +1337,10 @@ async function startServer() {
 
           if (isLastUserMsg && urlContextBlock) {
             textChunks.push(urlContextBlock);
+          }
+
+          if (isLastUserMsg && liveSearchContextBlock) {
+            textChunks.push(liveSearchContextBlock);
           }
 
           if (isLastUserMsg && locationContextBlock && (useMapsGrounding || isPlaceOrMapQuery)) {
@@ -1166,7 +1404,7 @@ async function startServer() {
                   model: groqModel,
                   messages: normalizedMessages,
                   stream: true,
-                  temperature: 0.6,
+                  temperature: isCodingAssistanceQuery ? 0.35 : 0.6,
                   max_tokens: 4096,
                 }),
               }),
