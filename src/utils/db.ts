@@ -8,8 +8,8 @@ import {
 const DB_NAME = 'mantrana_ai_db';
 const DB_VERSION = 2;
 const STORE_SESSIONS = 'sessions';
-const ACTIVE_ACCOUNT_STORAGE_KEY = 'mantrana-active-user-account-v2';
-const REGISTERED_ACCOUNTS_STORAGE_KEY = 'mantrana-registered-accounts-v1';
+const ACTIVE_ACCOUNT_STORAGE_KEY = 'mantrana-active-user-account-v3';
+const REGISTERED_ACCOUNTS_STORAGE_KEY = 'mantrana-registered-accounts-v2';
 
 export interface CachedRegisteredAccount {
   uid: string;
@@ -21,6 +21,7 @@ export interface CachedRegisteredAccount {
 
 export function getRegisteredAccounts(): CachedRegisteredAccount[] {
   try {
+    localStorage.removeItem('mantrana-registered-accounts-v1');
     const raw = localStorage.getItem(REGISTERED_ACCOUNTS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
@@ -29,6 +30,8 @@ export function getRegisteredAccounts(): CachedRegisteredAccount[] {
       (item) =>
         item &&
         typeof item.username === 'string' &&
+        typeof item.email === 'string' &&
+        !item.email.toLowerCase().endsWith('@mantrana.local') &&
         typeof item.passwordHash === 'string'
     );
   } catch {
@@ -38,15 +41,22 @@ export function getRegisteredAccounts(): CachedRegisteredAccount[] {
 
 export function saveRegisteredAccount(entry: CachedRegisteredAccount): void {
   try {
+    const cleanEmail = (entry.email || '').trim().toLowerCase();
+    const cleanUsername = (entry.username || '').trim();
+    if (!cleanEmail || cleanEmail.endsWith('@mantrana.local') || !cleanUsername) {
+      return;
+    }
     const existing = getRegisteredAccounts();
-    const lower = entry.username.trim().toLowerCase();
+    const lowerUser = cleanUsername.toLowerCase();
     const filtered = existing.filter(
-      (a) => a.username.trim().toLowerCase() !== lower
+      (a) =>
+        a.username.trim().toLowerCase() !== lowerUser &&
+        a.email.trim().toLowerCase() !== cleanEmail
     );
     filtered.push({
       uid: entry.uid,
-      username: entry.username.trim(),
-      email: (entry.email || `${lower}@mantrana.local`).trim().toLowerCase(),
+      username: cleanUsername,
+      email: cleanEmail,
       passwordHash: entry.passwordHash,
       createdAt: entry.createdAt || Date.now(),
     });
@@ -58,19 +68,23 @@ export function saveRegisteredAccount(entry: CachedRegisteredAccount): void {
 
 export function getSavedUserAccount(): UserAccount | null {
   try {
+    localStorage.removeItem('mantrana-active-user-account-v2');
     const raw = localStorage.getItem(ACTIVE_ACCOUNT_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.username === 'string' && parsed.username.trim()) {
+    if (
+      parsed &&
+      typeof parsed.username === 'string' &&
+      parsed.username.trim() &&
+      typeof parsed.email === 'string' &&
+      parsed.email.trim() &&
+      !parsed.email.trim().toLowerCase().endsWith('@mantrana.local')
+    ) {
       const cleanUsername = parsed.username.trim();
-      const internalEmail = (
-        parsed.email || `${cleanUsername.toLowerCase()}@mantrana.local`
-      )
-        .trim()
-        .toLowerCase();
+      const cleanEmail = parsed.email.trim().toLowerCase();
       return {
         uid: parsed.uid || `user-${cleanUsername.toLowerCase()}`,
-        email: internalEmail,
+        email: cleanEmail,
         username: cleanUsername,
         createdAt: parsed.createdAt || Date.now(),
       };
@@ -83,21 +97,22 @@ export function getSavedUserAccount(): UserAccount | null {
 
 export function setSavedUserAccount(account: UserAccount | null): void {
   try {
+    localStorage.removeItem('mantrana-active-user-account-v2');
     if (!account) {
       localStorage.removeItem(ACTIVE_ACCOUNT_STORAGE_KEY);
     } else {
       const cleanUsername = account.username.trim();
-      const internalEmail = (
-        account.email || `${cleanUsername.toLowerCase()}@mantrana.local`
-      )
-        .trim()
-        .toLowerCase();
+      const cleanEmail = (account.email || '').trim().toLowerCase();
+      if (!cleanEmail || cleanEmail.endsWith('@mantrana.local')) {
+        localStorage.removeItem(ACTIVE_ACCOUNT_STORAGE_KEY);
+        return;
+      }
       localStorage.setItem(
         ACTIVE_ACCOUNT_STORAGE_KEY,
         JSON.stringify({
           ...account,
           username: cleanUsername,
-          email: internalEmail,
+          email: cleanEmail,
         })
       );
     }

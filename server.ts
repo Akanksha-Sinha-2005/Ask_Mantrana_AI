@@ -2154,12 +2154,37 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
     return null;
   }
 
+  function validateEmailFormat(email: string): string | null {
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return 'Please enter a valid email address.';
+    }
+    if (email.toLowerCase().endsWith('@mantrana.local')) {
+      return 'Please enter a valid email address.';
+    }
+    return null;
+  }
+
   function readAccountsMap(): Record<string, StoredAccountRecord> {
     try {
       ensureDataDir();
       if (!fs.existsSync(accountsFilePath)) return {};
       const raw = fs.readFileSync(accountsFilePath, 'utf-8');
-      return JSON.parse(raw) || {};
+      const parsed = (JSON.parse(raw) || {}) as Record<string, StoredAccountRecord>;
+      // Remove legacy username-only (@mantrana.local) accounts
+      let removedLegacy = false;
+      for (const [key, acc] of Object.entries(parsed)) {
+        if (
+          key.endsWith('@mantrana.local') ||
+          (acc?.email && acc.email.toLowerCase().endsWith('@mantrana.local'))
+        ) {
+          delete parsed[key];
+          removedLegacy = true;
+        }
+      }
+      if (removedLegacy) {
+        writeAccountsMap(parsed);
+      }
+      return parsed;
     } catch {
       return {};
     }
@@ -2203,12 +2228,16 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
     try {
       const {
         mode = 'signup',
+        email,
         username,
+        identifier,
         password,
         knownAccounts,
       } = req.body as {
         mode?: 'signup' | 'login';
+        email?: string;
         username?: string;
+        identifier?: string;
         password?: string;
         knownAccounts?: Array<{
           uid?: string;
@@ -2219,45 +2248,68 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
         }>;
       };
 
+      const trimmedEmail = (email || '').trim().toLowerCase();
       const trimmedUsername = (username || '').trim();
       const usernameLower = trimmedUsername.toLowerCase();
+      const loginIdentifier = (identifier || email || username || '').trim().toLowerCase();
       const rawPassword = password || '';
 
-      const usernameErr = validateUsernameFormat(trimmedUsername);
-      if (usernameErr) {
-        res.status(400).json({ error: usernameErr });
-        return;
-      }
-
       if (mode === 'signup') {
+        const emailErr = validateEmailFormat(trimmedEmail);
+        if (emailErr) {
+          res.status(400).json({ error: emailErr });
+          return;
+        }
+
+        const usernameErr = validateUsernameFormat(trimmedUsername);
+        if (usernameErr) {
+          res.status(400).json({ error: usernameErr });
+          return;
+        }
+
         const passwordErr = validatePasswordComplexity(rawPassword);
         if (passwordErr) {
           res.status(400).json({ error: passwordErr });
           return;
         }
-      } else if (!rawPassword) {
-        res.status(400).json({ error: 'Please enter your password.' });
-        return;
+      } else {
+        if (!loginIdentifier) {
+          res.status(400).json({ error: 'Please enter your email or username.' });
+          return;
+        }
+        if (!rawPassword) {
+          res.status(400).json({ error: 'Please enter your password.' });
+          return;
+        }
       }
 
       const accounts = readAccountsMap();
       const now = Date.now();
 
-      // Re-hydrate any client-cached accounts so uniqueness checks and logins remain intact across server restarts
+      // Re-hydrate valid email+username client-cached accounts across server restarts
       if (Array.isArray(knownAccounts)) {
         let updated = false;
         for (const ka of knownAccounts) {
+          const kaEmail = (ka?.email || '').trim().toLowerCase();
           const kaUsername = (ka?.username || '').trim();
           const kaLower = kaUsername.toLowerCase();
-          if (!kaLower || !ka?.passwordHash) continue;
+          if (
+            !kaEmail ||
+            kaEmail.endsWith('@mantrana.local') ||
+            !kaLower ||
+            !ka?.passwordHash
+          ) {
+            continue;
+          }
           const alreadyPresent = Object.values(accounts).some(
-            (acc) => (acc.username || '').trim().toLowerCase() === kaLower
+            (acc) =>
+              (acc.email || '').trim().toLowerCase() === kaEmail ||
+              (acc.username || '').trim().toLowerCase() === kaLower
           );
           if (!alreadyPresent) {
-            const internalEmail = (ka.email || `${kaLower}@mantrana.local`).trim().toLowerCase();
-            accounts[internalEmail] = {
-              uid: ka.uid || `user-${emailToFileKey(internalEmail).slice(0, 20)}`,
-              email: internalEmail,
+            accounts[kaEmail] = {
+              uid: ka.uid || `user-${emailToFileKey(kaEmail).slice(0, 20)}`,
+              email: kaEmail,
               username: kaUsername,
               passwordHash: ka.passwordHash,
               createdAt: ka.createdAt || now,
@@ -2273,10 +2325,11 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
 
       const allAccounts = Object.values(accounts);
       const globalPasswordHash = hashPasswordGlobal(rawPassword);
-      const internalEmail = `${usernameLower}@mantrana.local`;
 
       if (mode === 'signup') {
-        // Check uniqueness: No two users can have the same username OR the same password
+        const emailExists = allAccounts.some(
+          (acc) => (acc.email || '').trim().toLowerCase() === trimmedEmail
+        );
         const usernameExists = allAccounts.some(
           (acc) => (acc.username || '').trim().toLowerCase() === usernameLower
         );
@@ -2286,42 +2339,32 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
             (acc.email && acc.passwordHash === hashPassword(acc.email, rawPassword))
         );
 
-        if (usernameExists && passwordExists) {
+        if (emailExists) {
           res.status(409).json({
-            error:
-              'This username or password already exists. No two users can have the same username or password.',
+            error: 'An account with this email already exists.',
           });
           return;
         }
 
-        if (usernameExists) {
+        if (usernameExists || passwordExists) {
           res.status(409).json({
-            error:
-              'This username or password already exists (this username is already taken). Please choose a different username.',
+            error: 'This username or password already exists.',
           });
           return;
         }
 
-        if (passwordExists) {
-          res.status(409).json({
-            error:
-              'This username or password already exists (this password is already used by another user). Please choose a different password.',
-          });
-          return;
-        }
-
-        const uid = `user-${emailToFileKey(internalEmail).slice(0, 20)}`;
+        const uid = `user-${emailToFileKey(trimmedEmail).slice(0, 20)}`;
         const newRecord: StoredAccountRecord = {
           uid,
-          email: internalEmail,
+          email: trimmedEmail,
           username: trimmedUsername.slice(0, 60),
           passwordHash: globalPasswordHash,
           createdAt: now,
           updatedAt: now,
         };
-        accounts[internalEmail] = newRecord;
+        accounts[trimmedEmail] = newRecord;
         writeAccountsMap(accounts);
-        const sessions = readUserSessions(internalEmail);
+        const sessions = readUserSessions(trimmedEmail);
 
         res.json({
           user: {
@@ -2338,13 +2381,14 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
 
       // mode === 'login'
       const existing = allAccounts.find(
-        (acc) => (acc.username || '').trim().toLowerCase() === usernameLower
+        (acc) =>
+          (acc.email || '').trim().toLowerCase() === loginIdentifier ||
+          (acc.username || '').trim().toLowerCase() === loginIdentifier
       );
 
       if (!existing) {
         res.status(404).json({
-          error:
-            'Account not found with this username. Please check your username or switch to Create Account.',
+          error: 'Account not found. Please check your details or create a new account.',
         });
         return;
       }
@@ -2356,12 +2400,11 @@ Return ONLY valid JSON matching this exact structure (no markdown fences):
 
       if (!matchesGlobal && !matchesLegacy) {
         res.status(401).json({
-          error: 'Incorrect username or password. Please try again.',
+          error: 'Invalid credentials. Please try again.',
         });
         return;
       }
 
-      // Upgrade legacy hash to global hash if needed
       if (!matchesGlobal && matchesLegacy) {
         existing.passwordHash = globalPasswordHash;
         existing.updatedAt = now;

@@ -552,11 +552,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   {userAccount.username}
                 </p>
                 <p
-                  className="text-[11px] text-slate-500 dark:text-slate-400 truncate flex items-center gap-1"
-                  title={`Signed in as ${userAccount.username}`}
+                  className="text-[11px] text-slate-500 dark:text-slate-400 truncate"
+                  title={userAccount.email}
                 >
-                  <User className="w-3 h-3 text-teal-600 dark:text-teal-400 shrink-0" />
-                  <span className="truncate">Signed in · Chats saved</span>
+                  {userAccount.email}
                 </p>
               </div>
             </div>
@@ -587,9 +586,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <div className="min-w-0 flex-1">
               <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
                 Log In / Create Account
-              </p>
-              <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
-                Sign in with username &amp; password
               </p>
             </div>
           </button>

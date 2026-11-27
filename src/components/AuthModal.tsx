@@ -1,12 +1,12 @@
 import React, { useState } from 'react';
 import {
   AlertCircle,
-  Check,
   Eye,
   EyeOff,
   Loader2,
   Lock,
   LogIn,
+  Mail,
   User,
   UserPlus,
   X,
@@ -37,7 +37,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   onAuthSuccess,
 }) => {
   const [authTab, setAuthTab] = useState<'signup' | 'login'>('signup');
+  const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
+  const [loginIdentifier, setLoginIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -45,75 +47,91 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   if (!isOpen) return null;
 
+  const trimmedEmail = email.trim().toLowerCase();
   const trimmedUsername = username.trim();
+  const trimmedIdentifier = loginIdentifier.trim();
+
+  const isEmailValid =
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail) &&
+    !trimmedEmail.endsWith('@mantrana.local');
+
   const isUsernameLengthOk =
     trimmedUsername.length >= USERNAME_MIN_LENGTH &&
     trimmedUsername.length <= USERNAME_MAX_LENGTH;
   const isUsernameAlphanumeric = USERNAME_ALPHANUMERIC_PATTERN.test(trimmedUsername);
-  const isUsernameValid = isUsernameLengthOk && isUsernameAlphanumeric;
 
   const hasMinLength = password.length >= PASSWORD_MIN_LENGTH;
   const hasLetter = /[a-zA-Z]/.test(password);
   const hasDigit = /[0-9]/.test(password);
   const hasSpecialChar = /[^a-zA-Z0-9\s]/.test(password);
-  const isPasswordValid =
-    hasMinLength && hasLetter && hasDigit && hasSpecialChar;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
 
-    if (!trimmedUsername) {
-      setErrorMsg('Please enter a username.');
-      return;
-    }
-
-    if (!isUsernameLengthOk) {
-      setErrorMsg(
-        `Username must be between ${USERNAME_MIN_LENGTH} and ${USERNAME_MAX_LENGTH} characters long.`
-      );
-      return;
-    }
-
-    if (!isUsernameAlphanumeric) {
-      setErrorMsg(
-        'Username must contain characters (letters) and numbers only (no spaces or special characters).'
-      );
-      return;
-    }
-
     if (authTab === 'signup') {
-      if (!hasMinLength) {
+      if (!trimmedEmail || !isEmailValid) {
+        setErrorMsg('Please enter a valid email address.');
+        return;
+      }
+
+      if (!trimmedUsername) {
+        setErrorMsg('Please enter a username.');
+        return;
+      }
+
+      if (!isUsernameLengthOk) {
         setErrorMsg(
-          `Password must be at least ${PASSWORD_MIN_LENGTH} characters long.`
+          `Username must be between ${USERNAME_MIN_LENGTH} and ${USERNAME_MAX_LENGTH} characters long.`
         );
         return;
       }
-      if (!hasLetter || !hasDigit || !hasSpecialChar) {
+
+      if (!isUsernameAlphanumeric) {
+        setErrorMsg('Username must contain letters and numbers only.');
+        return;
+      }
+
+      if (!hasMinLength || !hasLetter || !hasDigit || !hasSpecialChar) {
         setErrorMsg(
-          'Password must be at least 8 characters long and include at least 1 character (letter), 1 digit, and 1 special character.'
+          'Password must be at least 8 characters and include a letter, a number, and a special character.'
         );
         return;
       }
-    } else if (!password) {
-      setErrorMsg('Please enter your password.');
-      return;
+    } else {
+      if (!trimmedIdentifier) {
+        setErrorMsg('Please enter your email or username.');
+        return;
+      }
+      if (!password) {
+        setErrorMsg('Please enter your password.');
+        return;
+      }
     }
 
     setIsSubmitting(true);
     try {
       const knownAccounts = getRegisteredAccounts();
 
-      // 1. Authenticate and persist with our server-backed account store (enforcing unique username & unique password)
       const resp = await fetch('/api/account/auth', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: authTab,
-          username: trimmedUsername,
-          password,
-          knownAccounts,
-        }),
+        body: JSON.stringify(
+          authTab === 'signup'
+            ? {
+                mode: 'signup',
+                email: trimmedEmail,
+                username: trimmedUsername,
+                password,
+                knownAccounts,
+              }
+            : {
+                mode: 'login',
+                identifier: trimmedIdentifier,
+                password,
+                knownAccounts,
+              }
+        ),
       });
       const data = await resp.json();
 
@@ -121,7 +139,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         setErrorMsg(
           data.error ||
             (authTab === 'signup'
-              ? 'This username or password already exists.'
+              ? 'Could not create account with these details.'
               : 'Could not log in with these credentials.')
         );
         setIsSubmitting(false);
@@ -143,57 +161,56 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         });
       }
 
-      // 2. Background Firebase Auth sync using internal synthesized identifier (user is never asked for email)
-      const internalEmail =
-        resolvedUser.email ||
-        `${trimmedUsername.toLowerCase()}@mantrana.local`;
-      try {
-        if (authTab === 'signup') {
-          const cred = await createUserWithEmailAndPassword(
-            auth,
-            internalEmail,
-            password
-          );
-          if (cred.user) {
-            await updateProfile(cred.user, {
-              displayName: resolvedUser.username,
-            });
-            resolvedUser = {
-              ...resolvedUser,
-              uid: cred.user.uid,
-            };
-            await ensureFirestoreUserProfile(resolvedUser);
-          }
-        } else {
-          const cred = await signInWithEmailAndPassword(
-            auth,
-            internalEmail,
-            password
-          );
-          if (cred.user) {
-            resolvedUser = {
-              ...resolvedUser,
-              uid: cred.user.uid,
-              username: cred.user.displayName || resolvedUser.username,
-            };
-            await ensureFirestoreUserProfile(resolvedUser);
-          }
-        }
-      } catch (fbErr: any) {
-        const code = String(fbErr?.code || '');
-        if (code === 'auth/email-already-in-use') {
-          try {
-            const cred = await signInWithEmailAndPassword(
+      const accountEmail = resolvedUser.email;
+      if (accountEmail && !accountEmail.endsWith('@mantrana.local')) {
+        try {
+          if (authTab === 'signup') {
+            const cred = await createUserWithEmailAndPassword(
               auth,
-              internalEmail,
+              accountEmail,
               password
             );
             if (cred.user) {
-              resolvedUser = { ...resolvedUser, uid: cred.user.uid };
+              await updateProfile(cred.user, {
+                displayName: resolvedUser.username,
+              });
+              resolvedUser = {
+                ...resolvedUser,
+                uid: cred.user.uid,
+              };
               await ensureFirestoreUserProfile(resolvedUser);
             }
-          } catch {
-            // Fall back to server account session
+          } else {
+            const cred = await signInWithEmailAndPassword(
+              auth,
+              accountEmail,
+              password
+            );
+            if (cred.user) {
+              resolvedUser = {
+                ...resolvedUser,
+                uid: cred.user.uid,
+                username: cred.user.displayName || resolvedUser.username,
+              };
+              await ensureFirestoreUserProfile(resolvedUser);
+            }
+          }
+        } catch (fbErr: any) {
+          const code = String(fbErr?.code || '');
+          if (code === 'auth/email-already-in-use') {
+            try {
+              const cred = await signInWithEmailAndPassword(
+                auth,
+                accountEmail,
+                password
+              );
+              if (cred.user) {
+                resolvedUser = { ...resolvedUser, uid: cred.user.uid };
+                await ensureFirestoreUserProfile(resolvedUser);
+              }
+            } catch {
+              // Fall back to server account session
+            }
           }
         }
       }
@@ -217,32 +234,27 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/60 backdrop-blur-xs"
     >
       <div
-        className="relative w-full sm:max-w-md max-h-[92dvh] overflow-y-auto rounded-t-3xl sm:rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl pb-safe"
+        className="relative w-full sm:max-w-sm max-h-[92dvh] overflow-y-auto rounded-t-3xl sm:rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl pb-safe"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Modal Header */}
-        <div className="px-5 sm:px-6 pt-5 pb-3.5 border-b border-slate-200/80 dark:border-slate-800/80 flex items-center justify-between sticky top-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md z-10">
-          <div>
-            <h2 className="text-base font-bold font-display text-slate-900 dark:text-white">
-              {authTab === 'signup'
-                ? 'Create Account on Mantrana AI'
-                : 'Log In to Mantrana AI'}
-            </h2>
-          </div>
+        <div className="px-5 pt-4 pb-3 border-b border-slate-200/80 dark:border-slate-800/80 flex items-center justify-between">
+          <h2 className="text-sm font-bold font-display text-slate-900 dark:text-white">
+            {authTab === 'signup' ? 'Create Account' : 'Log In'}
+          </h2>
           <button
             type="button"
             onClick={onClose}
-            className="p-2 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
-            title="Close modal (Esc)"
-            aria-label="Close account modal"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            aria-label="Close"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         {/* Mode Switcher */}
-        <div className="px-6 pt-4">
-          <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200/70 dark:border-slate-700/60">
+        <div className="px-5 pt-4">
+          <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200/70 dark:border-slate-700/60">
             <button
               type="button"
               onClick={() => {
@@ -277,69 +289,105 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         </div>
 
         {/* Form Body */}
-        <form onSubmit={handleSubmit} className="px-6 py-4 space-y-3.5">
+        <form onSubmit={handleSubmit} className="px-5 py-4 space-y-3">
           {errorMsg && (
-            <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-900/70 flex items-start gap-2.5 text-xs text-rose-800 dark:text-rose-200">
+            <div className="p-2.5 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-900/70 flex items-start gap-2 text-xs text-rose-800 dark:text-rose-200">
               <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
               <span>{errorMsg}</span>
             </div>
           )}
 
-          {/* 1. Username Field (Characters & Numbers Only) */}
-          <div className="space-y-1.5">
-            <label
-              htmlFor="auth-username"
-              className="block text-xs font-medium text-slate-700 dark:text-slate-300"
-            >
-              Username
-            </label>
-            <div className="relative">
-              <User className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                id="auth-username"
-                type="text"
-                required
-                minLength={USERNAME_MIN_LENGTH}
-                maxLength={USERNAME_MAX_LENGTH}
-                autoComplete="username"
-                value={username}
-                onChange={(e) => {
-                  setUsername(e.target.value);
-                  if (errorMsg) setErrorMsg(null);
-                }}
-                placeholder="e.g. abc123"
-                className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
-              />
-            </div>
-            {authTab === 'signup' && (
-              <p
-                className={`text-[11px] flex items-center gap-1.5 ${
-                  !trimmedUsername
-                    ? 'text-slate-500 dark:text-slate-400'
-                    : isUsernameValid
-                      ? 'text-teal-600 dark:text-teal-400'
-                      : 'text-rose-600 dark:text-rose-400'
-                }`}
-              >
-                <Check
-                  className={`w-3 h-3 shrink-0 ${
-                    isUsernameValid ? 'opacity-100' : 'opacity-40'
-                  }`}
-                />
-                <span>
-                  Use letters (A–Z, a–z) and numbers (0–9) only — no spaces or symbols
-                </span>
-              </p>
-            )}
-          </div>
+          {authTab === 'signup' ? (
+            <>
+              {/* Email Field */}
+              <div className="space-y-1">
+                <label
+                  htmlFor="auth-email"
+                  className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  Email
+                </label>
+                <div className="relative">
+                  <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    id="auth-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={email}
+                    onChange={(e) => {
+                      setEmail(e.target.value);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
+                    placeholder="you@example.com"
+                    className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
+                  />
+                </div>
+              </div>
 
-          {/* 2. Password Field */}
-          <div className="space-y-1.5">
+              {/* Username Field */}
+              <div className="space-y-1">
+                <label
+                  htmlFor="auth-username"
+                  className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  Username
+                </label>
+                <div className="relative">
+                  <User className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    id="auth-username"
+                    type="text"
+                    required
+                    minLength={USERNAME_MIN_LENGTH}
+                    maxLength={USERNAME_MAX_LENGTH}
+                    autoComplete="username"
+                    value={username}
+                    onChange={(e) => {
+                      setUsername(e.target.value);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
+                    placeholder="e.g. abc123"
+                    className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
+                  />
+                </div>
+              </div>
+            </>
+          ) : (
+            /* Login Identifier (Email or Username) */
+            <div className="space-y-1">
+              <label
+                htmlFor="auth-identifier"
+                className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+              >
+                Email or Username
+              </label>
+              <div className="relative">
+                <User className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="auth-identifier"
+                  type="text"
+                  required
+                  autoComplete="username"
+                  value={loginIdentifier}
+                  onChange={(e) => {
+                    setLoginIdentifier(e.target.value);
+                    if (errorMsg) setErrorMsg(null);
+                  }}
+                  placeholder="you@example.com or abc123"
+                  className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-teal-500 transition-colors"
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Password Field */}
+          <div className="space-y-1">
             <label
               htmlFor="auth-password"
               className="block text-xs font-medium text-slate-700 dark:text-slate-300"
             >
-              {authTab === 'signup' ? 'Create Password' : 'Password'}
+              Password
             </label>
             <div className="relative">
               <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -372,41 +420,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 )}
               </button>
             </div>
-
-            {authTab === 'signup' && (
-              <div className="grid grid-cols-2 gap-1.5 pt-1 text-[11px]">
-                {[
-                  { label: 'At least 8 characters', met: hasMinLength },
-                  { label: 'At least 1 letter (a–z)', met: hasLetter },
-                  { label: 'At least 1 digit (0–9)', met: hasDigit },
-                  { label: 'At least 1 special char', met: hasSpecialChar },
-                ].map((req) => (
-                  <div
-                    key={req.label}
-                    className={`flex items-center gap-1.5 ${
-                      !password
-                        ? 'text-slate-500 dark:text-slate-400'
-                        : req.met
-                          ? 'text-teal-600 dark:text-teal-400 font-medium'
-                          : 'text-amber-600 dark:text-amber-400'
-                    }`}
-                  >
-                    <Check
-                      className={`w-3 h-3 shrink-0 ${
-                        req.met ? 'opacity-100' : 'opacity-35'
-                      }`}
-                    />
-                    <span>{req.label}</span>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
 
           <button
             type="submit"
             disabled={isSubmitting}
-            className="w-full py-2.5 px-4 rounded-xl bg-teal-600 hover:bg-teal-700 disabled:opacity-60 text-white text-sm font-semibold transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            className="w-full mt-1 py-2.5 px-4 rounded-xl bg-teal-600 hover:bg-teal-700 disabled:opacity-60 text-white text-sm font-semibold transition-colors flex items-center justify-center gap-2 cursor-pointer"
           >
             {isSubmitting ? (
               <>
@@ -415,20 +434,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   {authTab === 'signup' ? 'Creating account…' : 'Logging in…'}
                 </span>
               </>
+            ) : authTab === 'signup' ? (
+              <span>Create Account</span>
             ) : (
-              <>
-                {authTab === 'signup' ? (
-                  <>
-                    <UserPlus className="w-4 h-4" />
-                    <span>Create Account</span>
-                  </>
-                ) : (
-                  <>
-                    <LogIn className="w-4 h-4" />
-                    <span>Log In</span>
-                  </>
-                )}
-              </>
+              <span>Log In</span>
             )}
           </button>
         </form>
@@ -436,3 +445,4 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     </div>
   );
 };
+
