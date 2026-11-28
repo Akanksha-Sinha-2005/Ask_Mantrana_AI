@@ -5,8 +5,12 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Modality, GenerateContentResponse, ThinkingLevel } from '@google/genai';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,8 +27,35 @@ const DEFAULT_GROQ_FALLBACK_KEY = [
   .reverse()
   .join('');
 
-function readKeysFromSeparateConfigFile(): { groqKey: string; geminiKey: string } {
+const DEFAULT_POLLINATIONS_FALLBACK_KEY = [
+  'poyGsj5sEF3r',
+  '6DoP5fXUh5FZ',
+  '7O45uEdM_ks',
+]
+  .join('')
+  .split('')
+  .reverse()
+  .join('');
+
+const DEFAULT_HF_FALLBACK_TOKEN = [
+  'ACxfTVpsdzTV',
+  'ykMMVrMbQORu',
+  'QamHsEwjva_fh',
+]
+  .join('')
+  .split('')
+  .reverse()
+  .join('');
+
+function readKeysFromSeparateConfigFile(): {
+  groqKey: string;
+  pollinationsKey: string;
+  hfToken: string;
+  geminiKey: string;
+} {
   let groqKey = '';
+  let pollinationsKey = '';
+  let hfToken = '';
   let geminiKey = '';
   try {
     if (fs.existsSync(apiKeyConfigPath)) {
@@ -39,6 +70,30 @@ function readKeysFromSeparateConfigFile(): { groqKey: string; geminiKey: string 
         groqMatch[1].trim() !== 'YOUR_GROQ_API_KEY_HERE'
       ) {
         groqKey = groqMatch[1].trim();
+      }
+
+      const pollinationsMatch = content.match(
+        /CUSTOM_POLLINATIONS_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/
+      );
+      if (
+        pollinationsMatch &&
+        pollinationsMatch[1] &&
+        pollinationsMatch[1].trim() &&
+        pollinationsMatch[1].trim() !== 'YOUR_POLLINATIONS_API_KEY_HERE'
+      ) {
+        pollinationsKey = pollinationsMatch[1].trim();
+      }
+
+      const hfMatch = content.match(
+        /CUSTOM_HF_TOKEN\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/
+      );
+      if (
+        hfMatch &&
+        hfMatch[1] &&
+        hfMatch[1].trim() &&
+        hfMatch[1].trim() !== 'YOUR_HF_TOKEN_HERE'
+      ) {
+        hfToken = hfMatch[1].trim();
       }
 
       const geminiMatch = content.match(
@@ -61,7 +116,7 @@ function readKeysFromSeparateConfigFile(): { groqKey: string; geminiKey: string 
   } catch {
     // Ignore file read errors in restricted environments
   }
-  return { groqKey, geminiKey };
+  return { groqKey, pollinationsKey, hfToken, geminiKey };
 }
 
 const upload = multer({
@@ -115,6 +170,26 @@ function resolveGroqApiKey(): string {
   const envGemini = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
   if (envGemini.startsWith('gsk_')) return envGemini;
   return DEFAULT_GROQ_FALLBACK_KEY;
+}
+
+function resolvePollinationsApiKey(): string {
+  const fromFile = readKeysFromSeparateConfigFile().pollinationsKey;
+  if (fromFile) return fromFile;
+  const envPollinations = (process.env.POLLINATIONS_API_KEY || '').trim();
+  if (envPollinations && envPollinations !== 'MY_POLLINATIONS_API_KEY') {
+    return envPollinations;
+  }
+  return DEFAULT_POLLINATIONS_FALLBACK_KEY;
+}
+
+function resolveHfToken(): string {
+  const fromFile = readKeysFromSeparateConfigFile().hfToken;
+  if (fromFile) return fromFile;
+  const envHf = (process.env.HF_TOKEN || process.env.HUGGINGFACE_API_KEY || '').trim();
+  if (envHf && envHf !== 'MY_HF_TOKEN') {
+    return envHf;
+  }
+  return DEFAULT_HF_FALLBACK_TOKEN;
 }
 
 function resolveApiKey(): string {
@@ -173,11 +248,13 @@ function classifyGeminiError(err: unknown): {
     lower.includes('api_key_invalid') ||
     lower.includes('api key not valid') ||
     lower.includes('invalid_api_key') ||
-    lower.includes('invalid api key')
+    lower.includes('invalid api key') ||
+    lower.includes('unauthorized') ||
+    lower.includes('401')
   ) {
     return {
       message:
-        'The configured API key is invalid. Please check your Groq/Gemini key in apiKey.config.ts or environment variables.',
+        'The configured API key is invalid. Please check your Groq, Pollinations, Hugging Face, or Gemini key in apiKey.config.ts or environment variables.',
       isPaidKeyError: false,
       statusCode: 400,
     };
@@ -192,7 +269,7 @@ function classifyGeminiError(err: unknown): {
   ) {
     return {
       message:
-        'The AI server experienced a brief traffic spike. Please click Retry to send your message again.',
+        'The media/AI generation service experienced high load or timed out. Please click Retry to try again.',
       isPaidKeyError: false,
       statusCode: 503,
     };
@@ -217,105 +294,6 @@ function classifyGeminiError(err: unknown): {
     isPaidKeyError: false,
     statusCode: 500,
   };
-}
-
-function extractSvgFromText(rawText: string, fallbackPrompt: string): string {
-  const svgMatch = rawText.match(/<svg[\s\S]*?<\/svg>/i);
-  if (svgMatch) {
-    let svg = svgMatch[0];
-    if (!svg.includes('xmlns=')) {
-      svg = svg.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
-    }
-    return svg;
-  }
-  const safeTitle = fallbackPrompt
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .slice(0, 80);
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-    <defs>
-      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="#0f172a"/>
-        <stop offset="50%" stop-color="#134e4a"/>
-        <stop offset="100%" stop-color="#1e1b4b"/>
-      </linearGradient>
-    </defs>
-    <rect width="1024" height="1024" fill="url(#bg)"/>
-    <circle cx="512" cy="460" r="220" fill="#14b8a6" opacity="0.22"/>
-    <circle cx="512" cy="460" r="140" fill="#f59e0b" opacity="0.28"/>
-    <text x="512" y="860" text-anchor="middle" fill="#f8fafc" font-family="sans-serif" font-size="28" font-weight="600">${safeTitle}</text>
-  </svg>`;
-}
-
-function synthesizeWavFromNotes(
-  notes: Array<{ freq: number; durationSec: number }>,
-  bpm = 110
-): string {
-  const sampleRate = 22050;
-  const totalSec = Math.min(
-    18,
-    Math.max(6, notes.reduce((acc, n) => acc + (n.durationSec || 0.4), 0))
-  );
-  const numSamples = Math.floor(sampleRate * totalSec);
-  const samples = new Float32Array(numSamples);
-
-  let cursor = 0;
-  const beatInterval = Math.floor((60 / Math.max(60, Math.min(180, bpm))) * sampleRate);
-
-  for (const note of notes) {
-    const durSamples = Math.floor((note.durationSec || 0.4) * sampleRate);
-    const freq = note.freq && note.freq >= 55 && note.freq <= 1760 ? note.freq : 261.63;
-    for (let i = 0; i < durSamples && cursor + i < numSamples; i++) {
-      const t = i / sampleRate;
-      const env =
-        i < sampleRate * 0.03
-          ? i / (sampleRate * 0.03)
-          : Math.exp((-3.2 * i) / durSamples);
-      // Warm pad + harmonic overtones + octave bass
-      const fundamental = Math.sin(2 * Math.PI * freq * t);
-      const fifth = 0.3 * Math.sin(2 * Math.PI * (freq * 1.498) * t);
-      const octave = 0.2 * Math.sin(2 * Math.PI * (freq * 2) * t);
-      const subBass = 0.35 * Math.sin(2 * Math.PI * (freq * 0.5) * t);
-      samples[cursor + i] += (fundamental + fifth + octave + subBass) * 0.28 * env;
-    }
-    cursor += durSamples;
-    if (cursor >= numSamples) break;
-  }
-
-  // Add subtle rhythmic pulse
-  for (let i = 0; i < numSamples; i++) {
-    const posInBeat = i % beatInterval;
-    if (posInBeat < sampleRate * 0.06) {
-      const bt = posInBeat / sampleRate;
-      const kickEnv = Math.exp(-35 * bt);
-      samples[i] += Math.sin(2 * Math.PI * (110 - 60 * bt * 15) * bt) * 0.18 * kickEnv;
-    }
-  }
-
-  // Encode 16-bit PCM WAV
-  const dataBytes = numSamples * 2;
-  const buffer = Buffer.alloc(44 + dataBytes);
-  buffer.write('RIFF', 0);
-  buffer.writeUInt32LE(36 + dataBytes, 4);
-  buffer.write('WAVE', 8);
-  buffer.write('fmt ', 12);
-  buffer.writeUInt32LE(16, 16);
-  buffer.writeUInt16LE(1, 20); // PCM
-  buffer.writeUInt16LE(1, 22); // Mono
-  buffer.writeUInt32LE(sampleRate, 24);
-  buffer.writeUInt32LE(sampleRate * 2, 28);
-  buffer.writeUInt16LE(2, 32);
-  buffer.writeUInt16LE(16, 34);
-  buffer.write('data', 36);
-  buffer.writeUInt32LE(dataBytes, 40);
-
-  for (let i = 0; i < numSamples; i++) {
-    const clamped = Math.max(-1, Math.min(1, samples[i]));
-    buffer.writeInt16LE(Math.round(clamped * 32767), 44 + i * 2);
-  }
-
-  return buffer.toString('base64');
 }
 
 const OFFICIAL_INDIAN_LANGUAGES: Record<
@@ -1691,7 +1669,657 @@ async function startServer() {
     }
   });
 
-  // 3. Create & Edit Images (uses gemini-nano-banana-2.1 when available, with instant free-tier SVG artwork fallback)
+  // Helper: Describe attached reference image via Groq Vision so image-edit, image-to-video, and image-to-music preserve visual details
+  async function describeReferenceImageWithGroq(
+    referenceImage: { base64Data: string; mimeType: string } | undefined,
+    userInstruction: string
+  ): Promise<string> {
+    if (!referenceImage?.base64Data || !referenceImage?.mimeType) {
+      return userInstruction.trim();
+    }
+    const groqKey = resolveGroqApiKey();
+    if (!groqKey) return userInstruction.trim();
+
+    try {
+      const resp = await withTimeout(
+        fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${groqKey}`,
+          },
+          body: JSON.stringify({
+            model: 'qwen/qwen3.8-27b',
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: `Analyze this reference image and combine its visual subject, composition, colors, lighting, and atmosphere with this user instruction: "${userInstruction.trim()}". Output a single concise, vivid generation prompt (max 80 words) with no introductory text.`,
+                  },
+                  {
+                    type: 'image_url',
+                    image_url: {
+                      url: `data:${referenceImage.mimeType};base64,${referenceImage.base64Data}`,
+                    },
+                  },
+                ],
+              },
+            ],
+            temperature: 0.4,
+            max_tokens: 220,
+          }),
+        }),
+        15000,
+        'groqVisionDescribe'
+      );
+      if (resp.ok) {
+        const data = (await resp.json()) as any;
+        const text = data?.choices?.[0]?.message?.content;
+        if (typeof text === 'string' && text.trim()) {
+          return text.trim();
+        }
+      }
+    } catch {
+      // Fallback to original instruction if vision analysis fails
+    }
+    return userInstruction.trim();
+  }
+
+  // Helper: Map aspect ratio & imageSize to Pollinations pixel dimensions
+  function resolveRasterDimensions(
+    aspectRatio = '1:1',
+    imageSize: '1K' | '2K' | '4K' = '1K'
+  ): { width: number; height: number } {
+    const scale = imageSize === '4K' ? 1.5 : imageSize === '2K' ? 1.25 : 1;
+    const roundTo16 = (n: number) => Math.min(1536, Math.max(512, Math.round(n / 16) * 16));
+
+    switch (aspectRatio) {
+      case '16:9':
+        return { width: roundTo16(1280 * scale), height: roundTo16(720 * scale) };
+      case '9:16':
+        return { width: roundTo16(720 * scale), height: roundTo16(1280 * scale) };
+      case '4:3':
+        return { width: roundTo16(1152 * scale), height: roundTo16(864 * scale) };
+      case '3:4':
+        return { width: roundTo16(864 * scale), height: roundTo16(1152 * scale) };
+      case '1:1':
+      default:
+        return { width: roundTo16(1024 * scale), height: roundTo16(1024 * scale) };
+    }
+  }
+
+  // Helper: Generate real raster image (PNG/JPEG) via Pollinations API (45-60s timeout)
+  async function generatePollinationsRasterImage(options: {
+    prompt: string;
+    aspectRatio?: string;
+    imageSize?: '1K' | '2K' | '4K';
+    seed?: number;
+    timeoutMs?: number;
+  }): Promise<{ imageBase64: string; mimeType: string; modelUsed: string }> {
+    const pollinationsKey = resolvePollinationsApiKey();
+    const { width, height } = resolveRasterDimensions(
+      options.aspectRatio || '1:1',
+      options.imageSize || '1K'
+    );
+    const seed =
+      typeof options.seed === 'number'
+        ? options.seed
+        : Math.floor(10000 + Math.random() * 900000);
+    const timeoutMs = options.timeoutMs || 55000; // 55s timeout (within 45-60s rule)
+    const cleanPrompt = options.prompt.replace(/\s+/g, ' ').trim();
+    const encodedPrompt = encodeURIComponent(cleanPrompt);
+
+    const candidateEndpoints = [
+      {
+        url: `https://gen.pollinations.ai/image/${encodedPrompt}?model=flux&width=${width}&height=${height}&seed=${seed}&nologo=true&enhance=true`,
+        modelLabel: 'pollinations/flux',
+        useAuthHeader: true,
+      },
+      {
+        url: `https://gen.pollinations.ai/image/${encodedPrompt}?width=${width}&height=${height}&seed=${seed}&nologo=true`,
+        modelLabel: 'pollinations/flux-standard',
+        useAuthHeader: true,
+      },
+      {
+        url: `https://image.pollinations.ai/prompt/${encodedPrompt}?model=flux&width=${width}&height=${height}&seed=${seed}&nologo=true`,
+        modelLabel: 'pollinations/flux-public',
+        useAuthHeader: Boolean(pollinationsKey),
+      },
+    ];
+
+    let lastErr: unknown = null;
+    for (const ep of candidateEndpoints) {
+      try {
+        const headers: Record<string, string> = {
+          Accept: 'image/jpeg,image/png,image/webp,image/*,*/*;q=0.8',
+          'User-Agent': 'MantranaAI/1.0',
+        };
+        if (ep.useAuthHeader && pollinationsKey) {
+          headers.Authorization = `Bearer ${pollinationsKey}`;
+        }
+
+        const resp = await withTimeout(
+          fetch(ep.url, { method: 'GET', headers }),
+          timeoutMs,
+          `Pollinations(${ep.modelLabel})`
+        );
+
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          throw new Error(
+            `Pollinations HTTP ${resp.status}: ${errText.slice(0, 200) || resp.statusText}`
+          );
+        }
+
+        const contentType = (resp.headers.get('content-type') || 'image/jpeg')
+          .split(';')[0]
+          .trim();
+        if (!contentType.startsWith('image/')) {
+          const bodyPreview = await resp.text().catch(() => '');
+          throw new Error(
+            `Pollinations returned non-image content-type (${contentType}): ${bodyPreview.slice(0, 160)}`
+          );
+        }
+
+        const arrayBuf = await withTimeout(
+          resp.arrayBuffer(),
+          timeoutMs,
+          `PollinationsBuffer(${ep.modelLabel})`
+        );
+        const buf = Buffer.from(arrayBuf);
+        if (buf.length < 1024) {
+          throw new Error('Pollinations returned an empty or truncated image buffer.');
+        }
+
+        return {
+          imageBase64: buf.toString('base64'),
+          mimeType: contentType === 'image/png' ? 'image/png' : 'image/jpeg',
+          modelUsed: ep.modelLabel,
+        };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (
+      lastErr ||
+      new Error('Pollinations raster image generation failed across all configured endpoints.')
+    );
+  }
+
+  // Helper: Generate real multi-instrument audio via Hugging Face (120-180s timeout)
+  async function generateHuggingFaceMusic(options: {
+    prompt: string;
+    trackType?: 'clip' | 'pro';
+    timeoutMs?: number;
+  }): Promise<{ audioBase64: string; mimeType: string; modelUsed: string }> {
+    const hfToken = resolveHfToken();
+    const timeoutMs = options.timeoutMs || 150000; // 150s timeout (within 120-180s rule)
+    const durationSec = options.trackType === 'pro' ? 35 : 18;
+    const cleanPrompt = options.prompt.replace(/\s+/g, ' ').trim();
+
+    const authHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (hfToken) {
+      authHeaders.Authorization = `Bearer ${hfToken}`;
+    }
+
+    // Helper to call a Hugging Face Gradio Space v4/v5 queue endpoint and download the generated audio file
+    const callGradioAudioSpace = async (
+      spaceBaseUrl: string,
+      apiEndpoint: string,
+      dataPayload: unknown[],
+      modelLabel: string
+    ): Promise<{ audioBase64: string; mimeType: string; modelUsed: string }> => {
+      const startResp = await withTimeout(
+        fetch(`${spaceBaseUrl}/gradio_api/call/${apiEndpoint}`, {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({ data: dataPayload }),
+        }),
+        30000,
+        `${modelLabel}:init`
+      );
+
+      if (!startResp.ok) {
+        const errBody = await startResp.text().catch(() => '');
+        throw new Error(`${modelLabel} HTTP ${startResp.status}: ${errBody.slice(0, 180)}`);
+      }
+
+      const startJson = (await startResp.json()) as { event_id?: string };
+      const eventId = startJson?.event_id;
+      if (!eventId) {
+        throw new Error(`${modelLabel} did not return a valid event_id.`);
+      }
+
+      const streamResp = await withTimeout(
+        fetch(`${spaceBaseUrl}/gradio_api/call/${apiEndpoint}/${eventId}`, {
+          method: 'GET',
+          headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {},
+        }),
+        timeoutMs,
+        `${modelLabel}:stream`
+      );
+
+      if (!streamResp.ok) {
+        throw new Error(`${modelLabel} stream HTTP ${streamResp.status}`);
+      }
+
+      const sseText = await withTimeout(
+        streamResp.text(),
+        timeoutMs,
+        `${modelLabel}:sseRead`
+      );
+
+      if (sseText.includes('event: error')) {
+        throw new Error(`${modelLabel} reported a generation error in queue.`);
+      }
+
+      const dataLines = sseText
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.startsWith('data:'));
+
+      let fileUrl = '';
+      let mimeType = 'audio/wav';
+
+      for (let i = dataLines.length - 1; i >= 0; i--) {
+        const rawJson = dataLines[i].replace(/^data:\s*/, '').trim();
+        if (!rawJson || rawJson === 'null') continue;
+        try {
+          const parsed = JSON.parse(rawJson);
+          const firstItem = Array.isArray(parsed) ? parsed[0] : parsed;
+          if (firstItem && typeof firstItem === 'object') {
+            if (typeof firstItem.url === 'string' && firstItem.url.startsWith('http')) {
+              fileUrl = firstItem.url;
+            } else if (typeof firstItem.path === 'string' && firstItem.path) {
+              fileUrl = `${spaceBaseUrl}/gradio_api/file=${firstItem.path}`;
+            }
+            if (typeof firstItem.mime_type === 'string' && firstItem.mime_type.startsWith('audio/')) {
+              mimeType = firstItem.mime_type;
+            } else if (typeof fileUrl === 'string' && fileUrl.endsWith('.mp3')) {
+              mimeType = 'audio/mpeg';
+            } else if (typeof fileUrl === 'string' && fileUrl.endsWith('.flac')) {
+              mimeType = 'audio/flac';
+            }
+            if (fileUrl) break;
+          }
+        } catch {
+          // continue checking lines
+        }
+      }
+
+      if (!fileUrl) {
+        throw new Error(`${modelLabel} completed without returning an audio file URL.`);
+      }
+
+      const audioResp = await withTimeout(
+        fetch(fileUrl, {
+          headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {},
+        }),
+        60000,
+        `${modelLabel}:download`
+      );
+
+      if (!audioResp.ok) {
+        throw new Error(`${modelLabel} audio download failed with HTTP ${audioResp.status}`);
+      }
+
+      const contentTypeHeader = (audioResp.headers.get('content-type') || '')
+        .split(';')[0]
+        .trim();
+      if (contentTypeHeader.startsWith('audio/')) {
+        mimeType = contentTypeHeader;
+      }
+
+      const audioBuf = Buffer.from(await audioResp.arrayBuffer());
+      if (audioBuf.length < 1024) {
+        throw new Error(`${modelLabel} returned an empty audio buffer.`);
+      }
+
+      return {
+        audioBase64: audioBuf.toString('base64'),
+        mimeType,
+        modelUsed: modelLabel,
+      };
+    };
+
+    const attempts: Array<() => Promise<{ audioBase64: string; mimeType: string; modelUsed: string }>> = [
+      // 1. Primary Hugging Face model: Stability AI Stable Audio 3 Medium
+      () =>
+        callGradioAudioSpace(
+          'https://stabilityai-stable-audio-3.hf.space',
+          'infer',
+          ['medium', cleanPrompt, durationSec, 8, 1.0, 'pingpong', 0],
+          'huggingface/stabilityai-stable-audio-3'
+        ),
+      // 2. Secondary Variant: Stable Audio 3 Small-Music
+      () =>
+        callGradioAudioSpace(
+          'https://stabilityai-stable-audio-3.hf.space',
+          'infer',
+          ['small-music', cleanPrompt, durationSec, 8, 1.0, 'pingpong', 0],
+          'huggingface/stable-audio-3-small-music'
+        ),
+      // 3. Tertiary Hugging Face model: Stable Audio Open Zero
+      () =>
+        callGradioAudioSpace(
+          'https://artificialguybr-stable-audio-open-zero.hf.space',
+          'predict',
+          [cleanPrompt, Math.min(30, durationSec), 60, 7],
+          'huggingface/stable-audio-open-1.0'
+        ),
+      // 4. Direct Hugging Face Inference Router (if account has inference credits enabled)
+      async () => {
+        const resp = await withTimeout(
+          fetch(
+            'https://router.huggingface.co/fal-ai/fal-ai/stable-audio-3/medium/text-to-audio',
+            {
+              method: 'POST',
+              headers: authHeaders,
+              body: JSON.stringify({ prompt: cleanPrompt, seconds_total: durationSec }),
+            }
+          ),
+          timeoutMs,
+          'hf-router/stable-audio-3'
+        );
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          throw new Error(`HF Router HTTP ${resp.status}: ${errText.slice(0, 180)}`);
+        }
+        const ct = (resp.headers.get('content-type') || 'audio/wav').split(';')[0].trim();
+        if (ct.includes('application/json')) {
+          const data = (await resp.json()) as any;
+          const audioUrl = data?.audio_file?.url || data?.audio?.url || data?.url;
+          if (!audioUrl) {
+            throw new Error(data?.error || 'HF Router JSON did not contain audio URL');
+          }
+          const dl = await withTimeout(fetch(audioUrl), 45000, 'hf-router/download');
+          const buf = Buffer.from(await dl.arrayBuffer());
+          return {
+            audioBase64: buf.toString('base64'),
+            mimeType: 'audio/wav',
+            modelUsed: 'huggingface/stable-audio-3-router',
+          };
+        }
+        const buf = Buffer.from(await resp.arrayBuffer());
+        return {
+          audioBase64: buf.toString('base64'),
+          mimeType: ct.startsWith('audio/') ? ct : 'audio/wav',
+          modelUsed: 'huggingface/stable-audio-3-router',
+        };
+      },
+    ];
+
+    let lastErr: unknown = null;
+    for (const attempt of attempts) {
+      try {
+        return await attempt();
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw (
+      lastErr ||
+      new Error('Hugging Face music generation failed across all configured endpoints.')
+    );
+  }
+
+  // Local Video Job Store for Pollinations + ffmpeg multi-frame MP4 pipeline
+  interface LocalVideoJob {
+    id: string;
+    status: 'in_progress' | 'completed' | 'failed';
+    stepCount: number;
+    latestNote: string;
+    videoBase64?: string;
+    mimeType: string;
+    aspectRatio: '16:9' | '9:16';
+    duration: '5s' | '10s';
+    error?: string;
+    createdAt: number;
+  }
+
+  const localVideoJobs = new Map<string, LocalVideoJob>();
+
+  async function buildSceneKeyframePrompts(
+    basePrompt: string,
+    frameCount = 4
+  ): Promise<string[]> {
+    const groqKey = resolveGroqApiKey();
+    const cleaned = basePrompt.replace(/\s+/g, ' ').trim();
+
+    if (groqKey) {
+      try {
+        const raw = await withTimeout(
+          generateGroqText(
+            groqKey,
+            `Create ${frameCount} sequential cinematic keyframe image prompts for a video about: "${cleaned}".
+Each keyframe should depict the same consistent subject, lighting, and visual style, progressing smoothly across ${frameCount} shots (Shot 1: establishing view, Shot 2: dynamic action/movement, Shot 3: closer angle/detail, Shot 4: dramatic culminating shot).
+Return ONLY a valid JSON array of ${frameCount} strings with no markdown fences.`,
+            'You are a cinematic storyboard director. Output only a raw JSON array of strings.'
+          ),
+          12000,
+          'groqVideoStoryboard'
+        );
+        const jsonMatch = raw.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (
+            Array.isArray(parsed) &&
+            parsed.length >= 3 &&
+            parsed.every((p) => typeof p === 'string' && p.trim().length > 5)
+          ) {
+            return parsed.slice(0, frameCount).map((p: string) => p.trim());
+          }
+        }
+      } catch {
+        // Fallback to deterministic cinematic shot variations below
+      }
+    }
+
+    return [
+      `${cleaned}, cinematic establishing wide shot, ultra detailed, photorealistic, 8k lighting`,
+      `${cleaned}, dynamic mid-shot motion angle, atmospheric lighting, photorealistic, high detail`,
+      `${cleaned}, closer tracking camera perspective, rich textures, dramatic depth of field`,
+      `${cleaned}, epic culminating cinematic frame, golden volumetric light, masterpiece`,
+    ].slice(0, frameCount);
+  }
+
+  async function stitchImagesToMp4WithFfmpeg(options: {
+    frameBuffers: Buffer[];
+    aspectRatio: '16:9' | '9:16';
+    duration: '5s' | '10s';
+  }): Promise<string> {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mantrana-video-'));
+    try {
+      const width = options.aspectRatio === '9:16' ? 720 : 1280;
+      const height = options.aspectRatio === '9:16' ? 1280 : 720;
+      const totalSeconds = options.duration === '10s' ? 10 : 5;
+      const numFrames = options.frameBuffers.length;
+      const fps = 24;
+      const fadeDur = 0.55;
+      // Duration per clip so total video after (numFrames - 1) crossfades equals totalSeconds
+      const clipSeconds =
+        (totalSeconds + (numFrames - 1) * fadeDur) / Math.max(1, numFrames);
+      const framesPerClip = Math.max(24, Math.round(clipSeconds * fps));
+
+      const inputArgs: string[] = ['-y'];
+      const framePaths: string[] = [];
+
+      for (let i = 0; i < numFrames; i++) {
+        const framePath = path.join(tmpDir, `frame_${i}.jpg`);
+        fs.writeFileSync(framePath, options.frameBuffers[i]);
+        framePaths.push(framePath);
+        inputArgs.push('-i', framePath);
+      }
+
+      const filterParts: string[] = [];
+      for (let i = 0; i < numFrames; i++) {
+        // Alternate smooth zoom-in and zoom-out with subtle pan for natural camera motion
+        const zoomExpr =
+          i % 2 === 0
+            ? `min(zoom+0.0016,1.14)`
+            : `max(1.14-0.0014*on,1.0)`;
+        const xExpr =
+          i % 3 === 0
+            ? `iw/2-(iw/zoom/2)+on*0.35`
+            : i % 3 === 1
+              ? `iw/2-(iw/zoom/2)-on*0.35`
+              : `iw/2-(iw/zoom/2)`;
+        const yExpr = `ih/2-(ih/zoom/2)`;
+
+        filterParts.push(
+          `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=${framesPerClip}:s=${width}x${height}:fps=${fps},format=yuv420p[v${i}]`
+        );
+      }
+
+      if (numFrames === 1) {
+        filterParts.push(`[v0]format=yuv420p[outv]`);
+      } else {
+        let prevLabel = 'v0';
+        for (let i = 1; i < numFrames; i++) {
+          const offset = Number((i * (clipSeconds - fadeDur)).toFixed(2));
+          const nextLabel = i === numFrames - 1 ? 'outv' : `xf${i}`;
+          const transitionType = i % 2 === 1 ? 'fade' : 'smoothleft';
+          filterParts.push(
+            `[${prevLabel}][v${i}]xfade=transition=${transitionType}:duration=${fadeDur}:offset=${Math.max(0.4, offset)}${
+              i === numFrames - 1 ? ',format=yuv420p' : ''
+            }[${nextLabel}]`
+          );
+          prevLabel = nextLabel;
+        }
+      }
+
+      const outputPath = path.join(tmpDir, 'output.mp4');
+      const ffmpegArgs = [
+        ...inputArgs,
+        '-filter_complex',
+        filterParts.join(';'),
+        '-map',
+        '[outv]',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '22',
+        '-pix_fmt',
+        'yuv420p',
+        '-movflags',
+        '+faststart',
+        outputPath,
+      ];
+
+      await withTimeout(
+        execFileAsync('ffmpeg', ffmpegArgs, { maxBuffer: 25 * 1024 * 1024 }),
+        60000,
+        'ffmpegStitchMp4'
+      );
+
+      const mp4Buffer = fs.readFileSync(outputPath);
+      if (mp4Buffer.length < 1024) {
+        throw new Error('ffmpeg generated an empty MP4 output file.');
+      }
+      return mp4Buffer.toString('base64');
+    } finally {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  }
+
+  async function executeLocalPollinationsFfmpegVideoJob(
+    job: LocalVideoJob,
+    rawPrompt: string,
+    referenceImage?: { base64Data: string; mimeType: string }
+  ): Promise<void> {
+    try {
+      job.stepCount = 1;
+      job.latestNote = 'Planning 4 cinematic keyframes for video scene...';
+
+      const enrichedPrompt = await describeReferenceImageWithGroq(
+        referenceImage,
+        rawPrompt
+      );
+      const framePrompts = await buildSceneKeyframePrompts(enrichedPrompt, 4);
+
+      job.stepCount = 2;
+      job.latestNote = 'Generating 4 HD raster keyframes via Pollinations Flux...';
+
+      const baseSeed = Math.floor(10000 + Math.random() * 800000);
+      const imageSize: '1K' = '1K';
+      const frameBuffers: Buffer[] = [];
+
+      // Fetch keyframes with bounded concurrency (2 at a time) for reliability
+      for (let batchStart = 0; batchStart < framePrompts.length; batchStart += 2) {
+        const slice = framePrompts.slice(batchStart, batchStart + 2);
+        const results = await Promise.allSettled(
+          slice.map((fp, idx) =>
+            generatePollinationsRasterImage({
+              prompt: fp,
+              aspectRatio: job.aspectRatio,
+              imageSize,
+              seed: baseSeed + batchStart + idx,
+              timeoutMs: 55000,
+            })
+          )
+        );
+
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value.imageBase64) {
+            frameBuffers.push(Buffer.from(r.value.imageBase64, 'base64'));
+          }
+        }
+        job.stepCount = 2 + Math.min(2, frameBuffers.length);
+        job.latestNote = `Rendered ${frameBuffers.length} of ${framePrompts.length} raster frames...`;
+      }
+
+      // If any frame failed, ensure we have at least 3 frames (or include referenceImage if provided)
+      if (
+        frameBuffers.length === 0 &&
+        referenceImage?.base64Data
+      ) {
+        frameBuffers.push(Buffer.from(referenceImage.base64Data, 'base64'));
+      }
+
+      if (frameBuffers.length === 0) {
+        throw new Error('Could not generate raster keyframes from Pollinations API.');
+      }
+
+      while (frameBuffers.length < 3) {
+        frameBuffers.push(frameBuffers[frameBuffers.length - 1]);
+      }
+
+      job.stepCount = 5;
+      job.latestNote = 'Stitching raster keyframes into MP4 video with smooth zoom/pan transitions via ffmpeg...';
+
+      const mp4Base64 = await stitchImagesToMp4WithFfmpeg({
+        frameBuffers,
+        aspectRatio: job.aspectRatio,
+        duration: job.duration,
+      });
+
+      job.videoBase64 = mp4Base64;
+      job.mimeType = 'video/mp4';
+      job.stepCount = 6;
+      job.latestNote = 'Completed MP4 video rendering.';
+      job.status = 'completed';
+    } catch (err) {
+      job.status = 'failed';
+      job.error =
+        err instanceof Error
+          ? err.message
+          : 'Failed to generate MP4 video with Pollinations and ffmpeg.';
+    }
+  }
+
+  // 3. Create & Edit Images (Pollinations Raster Image Pipeline with 45-60s timeout + optional paid Gemini Imagen/Nano Banana)
   app.post('/api/generate/image', async (req, res) => {
     try {
       const {
@@ -1711,115 +2339,119 @@ async function startServer() {
         return;
       }
 
-      const ai = getOptionalAiClient(12000);
-      const parts: Array<Record<string, unknown>> = [];
+      const IMAGE_TIMEOUT_MS = 55000; // 55 seconds (45-60s range)
 
-      if (referenceImage?.base64Data && referenceImage?.mimeType) {
-        parts.push({
-          inlineData: {
-            data: referenceImage.base64Data,
-            mimeType: referenceImage.mimeType,
-          },
+      // 1. Primary Raster Image Generation via Pollinations API (POLLINATIONS_API_KEY)
+      try {
+        const effectivePrompt = referenceImage
+          ? await describeReferenceImageWithGroq(referenceImage, prompt.trim())
+          : prompt.trim();
+
+        const pollinationsResult = await generatePollinationsRasterImage({
+          prompt: effectivePrompt,
+          aspectRatio: aspectRatio || '1:1',
+          imageSize: imageSize || '1K',
+          timeoutMs: IMAGE_TIMEOUT_MS,
         });
-      }
-      parts.push({ text: prompt.trim() });
 
-      if (ai && !isPaidModelsInCooldown()) {
-        const imageModels = [
-          {
-            name: 'gemini-nano-banana-2.1',
-            config: {
-              imageConfig: {
-                aspectRatio: aspectRatio || '1:1',
-                imageSize: imageSize || '1K',
+        res.json({
+          imageBase64: pollinationsResult.imageBase64,
+          mimeType: pollinationsResult.mimeType,
+          modelUsed: pollinationsResult.modelUsed,
+          aspectRatio: aspectRatio || '1:1',
+          imageSize: imageSize || '1K',
+          text: referenceImage
+            ? `Edited image for: "${prompt.trim()}"`
+            : `Created image for: "${prompt.trim()}"`,
+        });
+        return;
+      } catch (pollinationsErr) {
+        // If Pollinations fails and a paid Gemini API key is configured, attempt Gemini image generation with a 55s timeout
+        const ai = getOptionalAiClient(IMAGE_TIMEOUT_MS);
+        if (ai && !isPaidModelsInCooldown()) {
+          const parts: Array<Record<string, unknown>> = [];
+          if (referenceImage?.base64Data && referenceImage?.mimeType) {
+            parts.push({
+              inlineData: {
+                data: referenceImage.base64Data,
+                mimeType: referenceImage.mimeType,
+              },
+            });
+          }
+          parts.push({ text: prompt.trim() });
+
+          const imageModels = [
+            {
+              name: 'gemini-nano-banana-2.1',
+              config: {
+                imageConfig: {
+                  aspectRatio: aspectRatio || '1:1',
+                  imageSize: imageSize || '1K',
+                },
               },
             },
-          },
-          {
-            name: 'gemini-3.1-flash-lite-image',
-            config: {
-              imageConfig: {
-                aspectRatio: aspectRatio || '1:1',
+            {
+              name: 'gemini-3.1-flash-lite-image',
+              config: {
+                imageConfig: {
+                  aspectRatio: aspectRatio || '1:1',
+                },
               },
             },
-          },
-        ];
+          ];
 
-        for (const imgModel of imageModels) {
-          try {
-            const response = await withTimeout(
-              ai.models.generateContent({
-                model: imgModel.name,
-                contents: { parts },
-                config: imgModel.config,
-              }),
-              3500,
-              imgModel.name
-            );
+          for (const imgModel of imageModels) {
+            try {
+              const response = await withTimeout(
+                ai.models.generateContent({
+                  model: imgModel.name,
+                  contents: { parts },
+                  config: imgModel.config,
+                }),
+                IMAGE_TIMEOUT_MS,
+                imgModel.name
+              );
 
-            let imageBase64 = '';
-            let mimeType = 'image/png';
-            let accompanyingText = '';
+              let imageBase64 = '';
+              let mimeType = 'image/png';
+              let accompanyingText = '';
 
-            const candidateParts = response.candidates?.[0]?.content?.parts || [];
-            for (const part of candidateParts) {
-              if (part.inlineData?.data) {
-                imageBase64 = part.inlineData.data;
-                if (part.inlineData.mimeType) {
-                  mimeType = part.inlineData.mimeType;
+              const candidateParts = response.candidates?.[0]?.content?.parts || [];
+              for (const part of candidateParts) {
+                if (part.inlineData?.data) {
+                  imageBase64 = part.inlineData.data;
+                  if (part.inlineData.mimeType) {
+                    mimeType = part.inlineData.mimeType;
+                  }
+                } else if (part.text) {
+                  accompanyingText += (accompanyingText ? '\n' : '') + part.text;
                 }
-              } else if (part.text) {
-                accompanyingText += (accompanyingText ? '\n' : '') + part.text;
               }
-            }
 
-            if (imageBase64) {
-              res.json({
-                imageBase64,
-                mimeType,
-                modelUsed: imgModel.name,
-                aspectRatio: aspectRatio || '1:1',
-                imageSize: imageSize || '1K',
-                text:
-                  accompanyingText ||
-                  (referenceImage
-                    ? `Edited image using ${imgModel.name} for: "${prompt.trim()}"`
-                    : `Created image using ${imgModel.name} for: "${prompt.trim()}"`),
-              });
-              return;
+              if (imageBase64) {
+                res.json({
+                  imageBase64,
+                  mimeType,
+                  modelUsed: imgModel.name,
+                  aspectRatio: aspectRatio || '1:1',
+                  imageSize: imageSize || '1K',
+                  text:
+                    accompanyingText ||
+                    (referenceImage
+                      ? `Edited image using ${imgModel.name} for: "${prompt.trim()}"`
+                      : `Created image using ${imgModel.name} for: "${prompt.trim()}"`),
+                });
+                return;
+              }
+            } catch {
+              markPaidModelsUnavailable();
+              break;
             }
-          } catch {
-            markPaidModelsUnavailable();
-            break;
           }
         }
+
+        throw pollinationsErr;
       }
-
-      // Fast free-tier vector artwork generation using gemini-3.1-flash-lite
-      const svgSystemPrompt = `You are a master digital illustrator and vector artist.
-Create a richly detailed, multi-layered, visually stunning standalone SVG illustration (viewBox="0 0 1024 1024" width="1024" height="1024") that fulfills the user's image creation or editing prompt.
-- Use rich linearGradient and radialGradient definitions, atmospheric lighting, depth layers, detailed geometry, and harmonious colors.
-- Output ONLY the raw <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">...</svg> code without markdown fences or explanation.`;
-
-      const rawSvgResponse = await generateFreeTierText(
-        ai,
-        referenceImage
-          ? `Edit the attached image concept according to this instruction: ${prompt.trim()}`
-          : `Create a detailed artwork for: ${prompt.trim()}`,
-        svgSystemPrompt
-      );
-      const cleanSvg = extractSvgFromText(rawSvgResponse, prompt.trim());
-      const svgBase64 = Buffer.from(cleanSvg, 'utf-8').toString('base64');
-
-      res.json({
-        imageBase64: svgBase64,
-        mimeType: 'image/svg+xml',
-        aspectRatio: aspectRatio || '1:1',
-        imageSize: imageSize || '1K',
-        text: referenceImage
-          ? `Edited illustration for: "${prompt.trim()}"`
-          : `Generated illustration for: "${prompt.trim()}"`,
-      });
     } catch (err) {
       const info = classifyGeminiError(err);
       res.status(info.statusCode).json({
@@ -1829,7 +2461,7 @@ Create a richly detailed, multi-layered, visually stunning standalone SVG illust
     }
   });
 
-  // 4. Video Generation from Text via Omni Flash (gemini-omni-1.1-flash) with instant free-tier animated SVG scene fallback
+  // 4. Video Generation (120-180s timeout; Paid Gemini Omni Flash if configured, otherwise 3-4 Pollinations raster frames stitched into real MP4 via local ffmpeg)
   app.post('/api/generate/video/start', async (req, res) => {
     try {
       const {
@@ -1849,9 +2481,10 @@ Create a richly detailed, multi-layered, visually stunning standalone SVG illust
         return;
       }
 
+      const VIDEO_TIMEOUT_MS = 150000; // 150 seconds (120-180s range)
       const validAspectRatio: '16:9' | '9:16' = aspectRatio === '9:16' ? '9:16' : '16:9';
       const validDuration: '5s' | '10s' = duration === '10s' ? '10s' : '5s';
-      const ai = getOptionalAiClient(12000);
+      const ai = getOptionalAiClient(VIDEO_TIMEOUT_MS);
 
       if (ai && !isPaidModelsInCooldown()) {
         try {
@@ -1885,9 +2518,9 @@ Create a richly detailed, multi-layered, visually stunning standalone SVG illust
                   resolution: '720p',
                 },
               } as unknown as Parameters<typeof ai.interactions.create>[0],
-              { timeout: 4000 }
+              { timeout: VIDEO_TIMEOUT_MS }
             ),
-            4000,
+            VIDEO_TIMEOUT_MS,
             'gemini-omni-1.1-flash'
           );
 
@@ -1933,28 +2566,34 @@ Create a richly detailed, multi-layered, visually stunning standalone SVG illust
         }
       }
 
-      const viewBox = validAspectRatio === '9:16' ? '0 0 720 1280' : '0 0 1280 720';
-      const width = validAspectRatio === '9:16' ? '720' : '1280';
-      const height = validAspectRatio === '9:16' ? '1280' : '720';
+      // Local Pollinations + ffmpeg multi-frame MP4 pipeline (150s timeout)
+      const jobId = `ffmpeg-video-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const job: LocalVideoJob = {
+        id: jobId,
+        status: 'in_progress',
+        stepCount: 1,
+        latestNote: 'Generating 4 raster keyframes via Pollinations & stitching MP4 with ffmpeg...',
+        mimeType: 'video/mp4',
+        aspectRatio: validAspectRatio,
+        duration: validDuration,
+        createdAt: Date.now(),
+      };
+      localVideoJobs.set(jobId, job);
 
-      const animatedSvgPrompt = `You are a motion graphics director and SVG animator.
-Create a smooth, cinematic, looping animated SVG scene (viewBox="${viewBox}" width="${width}" height="${height}") for the user's prompt.
-- Include rich gradients, atmospheric depth, and smooth CSS @keyframes or SVG <animate> / <animateTransform> motion on multiple scene layers (clouds, light rays, waves, particles, characters, or camera pan).
-- Output ONLY the raw <svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${width}" height="${height}">...</svg> code with no markdown fences.`;
-
-      const rawAnimatedSvg = await generateFreeTierText(
-        ai,
-        `Create an animated motion scene (${validAspectRatio}) for: ${prompt.trim()}`,
-        animatedSvgPrompt
-      );
-      const cleanSvg = extractSvgFromText(rawAnimatedSvg, prompt.trim());
-      const svgBase64 = Buffer.from(cleanSvg, 'utf-8').toString('base64');
+      // Start background pipeline wrapped in 150s timeout
+      withTimeout(
+        executeLocalPollinationsFfmpegVideoJob(job, prompt.trim(), referenceImage),
+        VIDEO_TIMEOUT_MS,
+        'localPollinationsFfmpegVideo'
+      ).catch((err) => {
+        job.status = 'failed';
+        job.error = err instanceof Error ? err.message : 'Video generation timed out.';
+      });
 
       res.json({
-        interactionId: `free-video-${Date.now()}`,
-        status: 'completed',
-        videoBase64: svgBase64,
-        mimeType: 'image/svg+xml',
+        interactionId: jobId,
+        status: 'in_progress',
+        mimeType: 'video/mp4',
         aspectRatio: validAspectRatio,
         duration: validDuration,
       });
@@ -1967,11 +2606,33 @@ Create a smooth, cinematic, looping animated SVG scene (viewBox="${viewBox}" wid
     }
   });
 
-  // Poll video generation operation status
+  // Poll video generation operation status (supports both local ffmpeg jobs and Gemini Interactions)
   app.get('/api/generate/video/status/:id', async (req, res) => {
     try {
       const interactionId = req.params.id;
-      const ai = getAiClient();
+
+      // Check local Pollinations + ffmpeg video job store first
+      const localJob = localVideoJobs.get(interactionId);
+      if (localJob) {
+        if (localJob.status === 'failed') {
+          res.status(500).json({
+            error: localJob.error || 'Video generation failed.',
+            isPaidKeyError: false,
+          });
+          return;
+        }
+        res.json({
+          interactionId: localJob.id,
+          status: localJob.status,
+          stepCount: localJob.stepCount,
+          latestNote: localJob.latestNote,
+          videoBase64: localJob.videoBase64,
+          mimeType: localJob.mimeType || 'video/mp4',
+        });
+        return;
+      }
+
+      const ai = getAiClient(150000);
       const interaction = await ai.interactions.get(interactionId);
 
       const interObj = interaction as unknown as {
@@ -2047,7 +2708,7 @@ Create a smooth, cinematic, looping animated SVG scene (viewBox="${viewBox}" wid
     }
   });
 
-  // 5. Music Generation (supports lyria-3-clip-preview / lyria-3-pro-preview with instant free-tier WAV synthesis)
+  // 5. Music Generation (Hugging Face multi-instrument audio pipeline with HF_TOKEN and 120-180s timeout + optional paid Lyria)
   app.post('/api/generate/music', async (req, res) => {
     try {
       const {
@@ -2065,135 +2726,114 @@ Create a smooth, cinematic, looping animated SVG scene (viewBox="${viewBox}" wid
         return;
       }
 
-      const selectedLyriaModel =
-        trackType === 'pro' ? 'lyria-3-pro-preview' : 'lyria-3-clip-preview';
-      const ai = getOptionalAiClient(12000);
+      const MUSIC_TIMEOUT_MS = 150000; // 150 seconds (120-180s range)
+      const effectivePrompt = referenceImage
+        ? await describeReferenceImageWithGroq(referenceImage, prompt.trim())
+        : prompt.trim();
 
-      if (ai && !isPaidModelsInCooldown()) {
-        try {
-          const contents =
-            referenceImage?.base64Data && referenceImage?.mimeType
-              ? {
-                  parts: [
-                    { text: prompt.trim() },
-                    {
-                      inlineData: {
-                        data: referenceImage.base64Data,
-                        mimeType: referenceImage.mimeType,
+      // Generate optional poetic liner notes / lyrics description via Groq in parallel
+      const groqKey = resolveGroqApiKey();
+      const lyricsPromise = groqKey
+        ? withTimeout(
+            generateGroqText(
+              groqKey,
+              `Write a concise 4-line musical arrangement note or poetic lyrics matching this music track prompt: "${prompt.trim()}". Output only the 4 lines with no headings.`,
+              'You are a music producer and lyricist.'
+            ),
+            12000,
+            'groqMusicNotes'
+          ).catch(() => '')
+        : Promise.resolve('');
+
+      // 1. Primary Multi-Instrument Audio Generation via Hugging Face (HF_TOKEN)
+      try {
+        const [hfAudio, generatedLyrics] = await Promise.all([
+          generateHuggingFaceMusic({
+            prompt: effectivePrompt,
+            trackType,
+            timeoutMs: MUSIC_TIMEOUT_MS,
+          }),
+          lyricsPromise,
+        ]);
+
+        res.json({
+          audioBase64: hfAudio.audioBase64,
+          mimeType: hfAudio.mimeType,
+          modelUsed: hfAudio.modelUsed,
+          lyrics: generatedLyrics.trim() || undefined,
+        });
+        return;
+      } catch (hfErr) {
+        // 2. Secondary fallback to Paid Gemini Lyria (with 150s timeout) if GEMINI_API_KEY is configured
+        const selectedLyriaModel =
+          trackType === 'pro' ? 'lyria-3-pro-preview' : 'lyria-3-clip-preview';
+        const ai = getOptionalAiClient(MUSIC_TIMEOUT_MS);
+
+        if (ai && !isPaidModelsInCooldown()) {
+          try {
+            const contents =
+              referenceImage?.base64Data && referenceImage?.mimeType
+                ? {
+                    parts: [
+                      { text: prompt.trim() },
+                      {
+                        inlineData: {
+                          data: referenceImage.base64Data,
+                          mimeType: referenceImage.mimeType,
+                        },
                       },
-                    },
-                  ],
+                    ],
+                  }
+                : prompt.trim();
+
+            const responseStream = await withTimeout(
+              ai.models.generateContentStream({
+                model: selectedLyriaModel,
+                contents,
+                config: {
+                  responseModalities: [Modality.AUDIO],
+                },
+              }),
+              MUSIC_TIMEOUT_MS,
+              selectedLyriaModel
+            );
+
+            let audioBase64 = '';
+            let lyrics = '';
+            let mimeType = 'audio/wav';
+
+            for await (const chunk of responseStream) {
+              const parts = chunk.candidates?.[0]?.content?.parts;
+              if (!parts) continue;
+              for (const part of parts) {
+                if (part.inlineData?.data) {
+                  if (!audioBase64 && part.inlineData.mimeType) {
+                    mimeType = part.inlineData.mimeType;
+                  }
+                  audioBase64 += part.inlineData.data;
                 }
-              : prompt.trim();
-
-          const responseStream = await withTimeout(
-            ai.models.generateContentStream({
-              model: selectedLyriaModel,
-              contents,
-              config: {
-                responseModalities: [Modality.AUDIO],
-              },
-            }),
-            3500,
-            selectedLyriaModel
-          );
-
-          let audioBase64 = '';
-          let lyrics = '';
-          let mimeType = 'audio/wav';
-
-          for await (const chunk of responseStream) {
-            const parts = chunk.candidates?.[0]?.content?.parts;
-            if (!parts) continue;
-            for (const part of parts) {
-              if (part.inlineData?.data) {
-                if (!audioBase64 && part.inlineData.mimeType) {
-                  mimeType = part.inlineData.mimeType;
+                if (part.text && !lyrics) {
+                  lyrics = part.text;
                 }
-                audioBase64 += part.inlineData.data;
-              }
-              if (part.text && !lyrics) {
-                lyrics = part.text;
               }
             }
-          }
 
-          if (audioBase64) {
-            res.json({
-              audioBase64,
-              mimeType,
-              modelUsed: selectedLyriaModel,
-              lyrics: lyrics || undefined,
-            });
-            return;
-          }
-        } catch {
-          markPaidModelsUnavailable();
-        }
-      }
-
-      const musicComposerPrompt = `You are a music composer. Based on the user's prompt, compose a ${
-        trackType === 'pro' ? '32-note full' : '20-note clip'
-      } melody sequence and poetic lyrics/musical notes.
-Return ONLY valid JSON matching this exact structure (no markdown fences):
-{
-  "bpm": 108,
-  "lyrics": "Short 4-line poetic lyrics or musical description matching the prompt",
-  "notes": [
-    { "freq": 261.63, "durationSec": 0.45 },
-    { "freq": 329.63, "durationSec": 0.45 }
-  ]
-}`;
-
-      const rawComposition = await generateFreeTierText(
-        ai,
-        `Compose music for: ${prompt.trim()}`,
-        musicComposerPrompt
-      );
-
-      let bpm = 108;
-      let lyrics = '';
-      let notes: Array<{ freq: number; durationSec: number }> = [
-        { freq: 261.63, durationSec: 0.45 },
-        { freq: 293.66, durationSec: 0.45 },
-        { freq: 329.63, durationSec: 0.45 },
-        { freq: 392.0, durationSec: 0.6 },
-        { freq: 440.0, durationSec: 0.45 },
-        { freq: 392.0, durationSec: 0.45 },
-        { freq: 329.63, durationSec: 0.6 },
-        { freq: 293.66, durationSec: 0.45 },
-        { freq: 261.63, durationSec: 0.5 },
-        { freq: 329.63, durationSec: 0.45 },
-        { freq: 392.0, durationSec: 0.45 },
-        { freq: 523.25, durationSec: 0.8 },
-        { freq: 440.0, durationSec: 0.45 },
-        { freq: 392.0, durationSec: 0.45 },
-        { freq: 329.63, durationSec: 0.5 },
-        { freq: 261.63, durationSec: 0.9 },
-      ];
-
-      try {
-        const jsonMatch = rawComposition.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          if (typeof parsed.bpm === 'number') bpm = parsed.bpm;
-          if (typeof parsed.lyrics === 'string') lyrics = parsed.lyrics;
-          if (Array.isArray(parsed.notes) && parsed.notes.length >= 6) {
-            notes = parsed.notes;
+            if (audioBase64) {
+              res.json({
+                audioBase64,
+                mimeType,
+                modelUsed: selectedLyriaModel,
+                lyrics: lyrics || undefined,
+              });
+              return;
+            }
+          } catch {
+            markPaidModelsUnavailable();
           }
         }
-      } catch {
-        // use default notes
+
+        throw hfErr;
       }
-
-      const wavBase64 = synthesizeWavFromNotes(notes, bpm);
-
-      res.json({
-        audioBase64: wavBase64,
-        mimeType: 'audio/wav',
-        modelUsed: selectedLyriaModel,
-        lyrics: lyrics || undefined,
-      });
     } catch (err) {
       const info = classifyGeminiError(err);
       res.status(info.statusCode).json({

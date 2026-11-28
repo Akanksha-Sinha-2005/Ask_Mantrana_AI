@@ -2260,10 +2260,12 @@ export default function App() {
 
                       {/* Message Bubble / Surface */}
                       <div
-                        className={`w-full rounded-2xl px-3.5 py-3 sm:px-4 sm:py-3.5 ${
+                        className={`rounded-2xl ${
                           isUser
-                            ? 'max-w-[92%] sm:max-w-[85%] bg-slate-200/75 dark:bg-slate-800/90 text-slate-900 dark:text-slate-100'
-                            : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100'
+                            ? 'w-fit max-w-[88%] sm:max-w-[78%] px-3.5 py-2 sm:px-4 sm:py-2.5 bg-slate-200/75 dark:bg-slate-800/90 text-slate-900 dark:text-slate-100'
+                            : `${
+                                msg.generatedMedia || msg.videoProgress ? 'w-full' : 'w-fit max-w-full'
+                              } px-3.5 py-2.5 sm:px-4 sm:py-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100`
                         }`}
                       >
                       {/* Attached Files inside Message */}
