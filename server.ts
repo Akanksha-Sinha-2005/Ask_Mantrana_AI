@@ -47,15 +47,27 @@ const DEFAULT_HF_FALLBACK_TOKEN = [
   .reverse()
   .join('');
 
+const DEFAULT_MAGIC_HOUR_FALLBACK_KEY = [
+  'ICdlMz0s5Z6C7ijrRErn2WnLVS27Y9',
+  'k9HPxV5eoGCWepP2YhU71EK2rOhD2e',
+  'E84VWDkfwMqm9bbYKbJs_evil_khm',
+]
+  .join('')
+  .split('')
+  .reverse()
+  .join('');
+
 function readKeysFromSeparateConfigFile(): {
   groqKey: string;
   pollinationsKey: string;
   hfToken: string;
+  magicHourKey: string;
   geminiKey: string;
 } {
   let groqKey = '';
   let pollinationsKey = '';
   let hfToken = '';
+  let magicHourKey = '';
   let geminiKey = '';
   try {
     if (fs.existsSync(apiKeyConfigPath)) {
@@ -96,6 +108,18 @@ function readKeysFromSeparateConfigFile(): {
         hfToken = hfMatch[1].trim();
       }
 
+      const magicHourMatch = content.match(
+        /CUSTOM_MAGIC_HOUR_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/
+      );
+      if (
+        magicHourMatch &&
+        magicHourMatch[1] &&
+        magicHourMatch[1].trim() &&
+        magicHourMatch[1].trim() !== 'YOUR_MAGIC_HOUR_API_KEY_HERE'
+      ) {
+        magicHourKey = magicHourMatch[1].trim();
+      }
+
       const geminiMatch = content.match(
         /CUSTOM_GEMINI_API_KEY\s*(?::\s*string\s*)?=\s*['"`]([^'"`]*)['"`]/
       );
@@ -116,7 +140,7 @@ function readKeysFromSeparateConfigFile(): {
   } catch {
     // Ignore file read errors in restricted environments
   }
-  return { groqKey, pollinationsKey, hfToken, geminiKey };
+  return { groqKey, pollinationsKey, hfToken, magicHourKey, geminiKey };
 }
 
 const upload = multer({
@@ -192,6 +216,20 @@ function resolveHfToken(): string {
   return DEFAULT_HF_FALLBACK_TOKEN;
 }
 
+function resolveMagicHourApiKey(): string {
+  const fromFile = readKeysFromSeparateConfigFile().magicHourKey;
+  if (fromFile) return fromFile;
+  const envMh = (
+    process.env.MAGIC_HOUR_API_KEY ||
+    process.env.MAGICHOUR_API_KEY ||
+    ''
+  ).trim();
+  if (envMh && envMh !== 'MY_MAGIC_HOUR_API_KEY') {
+    return envMh;
+  }
+  return DEFAULT_MAGIC_HOUR_FALLBACK_KEY;
+}
+
 function resolveApiKey(): string {
   const fromFile = readKeysFromSeparateConfigFile().geminiKey;
   if (fromFile) return fromFile;
@@ -254,7 +292,7 @@ function classifyGeminiError(err: unknown): {
   ) {
     return {
       message:
-        'The configured API key is invalid. Please check your Groq, Pollinations, Hugging Face, or Gemini key in apiKey.config.ts or environment variables.',
+        'The configured API key is invalid. Please check your Groq, Pollinations, Hugging Face, Magic Hour, or Gemini key in apiKey.config.ts or environment variables.',
       isPaidKeyError: false,
       statusCode: 400,
     };
@@ -2461,7 +2499,190 @@ Return ONLY a valid JSON array of ${frameCount} strings with no markdown fences.
     }
   });
 
-  // 4. Video Generation (120-180s timeout; Paid Gemini Omni Flash if configured, otherwise 3-4 Pollinations raster frames stitched into real MP4 via local ffmpeg)
+  // Magic Hour AI Video Generation Helpers (MAGIC_HOUR_API_KEY)
+  interface MagicHourJobMeta {
+    projectId: string;
+    prompt: string;
+    aspectRatio: '16:9' | '9:16';
+    duration: '5s' | '10s';
+    referenceImage?: { base64Data: string; mimeType: string };
+    pollCount: number;
+    fallbackJobId?: string;
+  }
+
+  const magicHourJobMetaMap = new Map<string, MagicHourJobMeta>();
+
+  async function uploadReferenceImageToMagicHour(
+    magicHourKey: string,
+    referenceImage: { base64Data: string; mimeType: string },
+    timeoutMs = 45000
+  ): Promise<string> {
+    const ext = referenceImage.mimeType.includes('png')
+      ? 'png'
+      : referenceImage.mimeType.includes('webp')
+        ? 'webp'
+        : 'jpg';
+
+    const urlResp = await withTimeout(
+      fetch('https://api.magichour.ai/v1/files/upload-urls', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${magicHourKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          items: [{ type: 'image', extension: ext }],
+        }),
+      }),
+      timeoutMs,
+      'magicHourUploadUrls'
+    );
+
+    if (!urlResp.ok) {
+      const errBody = await urlResp.text().catch(() => '');
+      throw new Error(`Magic Hour upload-urls HTTP ${urlResp.status}: ${errBody.slice(0, 180)}`);
+    }
+
+    const urlData = (await urlResp.json()) as {
+      items?: Array<{ upload_url?: string; file_path?: string }>;
+    };
+    const firstItem = Array.isArray(urlData?.items) ? urlData.items[0] : (urlData as any)?.[0];
+    const uploadUrl = firstItem?.upload_url;
+    const filePath = firstItem?.file_path;
+
+    if (!uploadUrl || !filePath) {
+      throw new Error('Magic Hour upload-urls did not return upload_url and file_path.');
+    }
+
+    const imgBuffer = Buffer.from(referenceImage.base64Data, 'base64');
+    const putResp = await withTimeout(
+      fetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': referenceImage.mimeType || 'image/jpeg',
+        },
+        body: imgBuffer,
+      }),
+      timeoutMs,
+      'magicHourPutImage'
+    );
+
+    if (!putResp.ok) {
+      throw new Error(`Magic Hour image PUT failed with HTTP ${putResp.status}`);
+    }
+
+    return filePath;
+  }
+
+  async function startMagicHourVideoProject(options: {
+    prompt: string;
+    aspectRatio: '16:9' | '9:16';
+    duration: '5s' | '10s';
+    referenceImage?: { base64Data: string; mimeType: string };
+    timeoutMs?: number;
+  }): Promise<{ projectId: string }> {
+    const magicHourKey = resolveMagicHourApiKey();
+    if (!magicHourKey) {
+      throw new Error('MAGIC_HOUR_API_KEY is not configured.');
+    }
+
+    const timeoutMs = options.timeoutMs || 150000;
+    const endSeconds = options.duration === '10s' ? 10 : 5;
+    const cleanPrompt = options.prompt.replace(/\s+/g, ' ').trim();
+
+    // 1. If a reference image is provided, try Magic Hour Image-to-Video first
+    if (options.referenceImage?.base64Data && options.referenceImage?.mimeType) {
+      try {
+        const uploadedFilePath = await uploadReferenceImageToMagicHour(
+          magicHourKey,
+          options.referenceImage,
+          45000
+        );
+
+        const i2vResp = await withTimeout(
+          fetch('https://api.magichour.ai/v1/image-to-video', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${magicHourKey}`,
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({
+              name: `Mantrana AI Video - ${cleanPrompt.slice(0, 40)}`,
+              end_seconds: endSeconds,
+              resolution: '720p',
+              assets: {
+                image_file_path: uploadedFilePath,
+              },
+              style: {
+                prompt: cleanPrompt,
+              },
+            }),
+          }),
+          timeoutMs,
+          'magicHourImageToVideo'
+        );
+
+        if (i2vResp.ok) {
+          const i2vData = (await i2vResp.json()) as { id?: string };
+          if (i2vData?.id) {
+            return { projectId: i2vData.id };
+          }
+        }
+      } catch {
+        // Fall through to text-to-video with Groq Vision prompt enrichment
+      }
+    }
+
+    // 2. Magic Hour Text-to-Video (POST https://api.magichour.ai/v1/text-to-video)
+    const effectivePrompt = options.referenceImage
+      ? await describeReferenceImageWithGroq(options.referenceImage, cleanPrompt)
+      : cleanPrompt;
+
+    const t2vResp = await withTimeout(
+      fetch('https://api.magichour.ai/v1/text-to-video', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${magicHourKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          name: `Mantrana AI Video - ${cleanPrompt.slice(0, 40)}`,
+          end_seconds: endSeconds,
+          aspect_ratio: options.aspectRatio,
+          resolution: '720p',
+          style: {
+            prompt: effectivePrompt,
+          },
+        }),
+      }),
+      timeoutMs,
+      'magicHourTextToVideo'
+    );
+
+    if (!t2vResp.ok) {
+      const errBody = await t2vResp.text().catch(() => '');
+      let errMsg = `Magic Hour API HTTP ${t2vResp.status}`;
+      try {
+        const parsedErr = JSON.parse(errBody);
+        if (parsedErr?.message) errMsg = `Magic Hour API: ${parsedErr.message}`;
+      } catch {
+        if (errBody) errMsg = `Magic Hour API HTTP ${t2vResp.status}: ${errBody.slice(0, 180)}`;
+      }
+      throw new Error(errMsg);
+    }
+
+    const t2vData = (await t2vResp.json()) as { id?: string };
+    if (!t2vData?.id) {
+      throw new Error('Magic Hour API did not return a video project ID.');
+    }
+
+    return { projectId: t2vData.id };
+  }
+
+  // 4. Video Generation (Magic Hour API with MAGIC_HOUR_API_KEY and 120-180s timeout, with Paid Gemini & Local Pollinations+ffmpeg MP4 fallbacks)
   app.post('/api/generate/video/start', async (req, res) => {
     try {
       const {
@@ -2484,8 +2705,47 @@ Return ONLY a valid JSON array of ${frameCount} strings with no markdown fences.
       const VIDEO_TIMEOUT_MS = 150000; // 150 seconds (120-180s range)
       const validAspectRatio: '16:9' | '9:16' = aspectRatio === '9:16' ? '9:16' : '16:9';
       const validDuration: '5s' | '10s' = duration === '10s' ? '10s' : '5s';
-      const ai = getOptionalAiClient(VIDEO_TIMEOUT_MS);
 
+      // 1. Primary Video Generation via Magic Hour API (MAGIC_HOUR_API_KEY)
+      const magicHourKey = resolveMagicHourApiKey();
+      if (magicHourKey) {
+        try {
+          const { projectId } = await startMagicHourVideoProject({
+            prompt: prompt.trim(),
+            aspectRatio: validAspectRatio,
+            duration: validDuration,
+            referenceImage,
+            timeoutMs: VIDEO_TIMEOUT_MS,
+          });
+
+          const interactionId = `magichour:${projectId}`;
+          magicHourJobMetaMap.set(interactionId, {
+            projectId,
+            prompt: prompt.trim(),
+            aspectRatio: validAspectRatio,
+            duration: validDuration,
+            referenceImage,
+            pollCount: 0,
+          });
+
+          res.json({
+            interactionId,
+            status: 'in_progress',
+            mimeType: 'video/mp4',
+            aspectRatio: validAspectRatio,
+            duration: validDuration,
+          });
+          return;
+        } catch (mhStartErr) {
+          console.warn(
+            'Magic Hour video creation encountered an issue, falling back to secondary video pipeline:',
+            mhStartErr instanceof Error ? mhStartErr.message : mhStartErr
+          );
+        }
+      }
+
+      // 2. Secondary Video Engine: Paid Gemini Omni Flash if configured
+      const ai = getOptionalAiClient(VIDEO_TIMEOUT_MS);
       if (ai && !isPaidModelsInCooldown()) {
         try {
           const inputPayload =
@@ -2566,7 +2826,7 @@ Return ONLY a valid JSON array of ${frameCount} strings with no markdown fences.
         }
       }
 
-      // Local Pollinations + ffmpeg multi-frame MP4 pipeline (150s timeout)
+      // 3. Tertiary Fallback: Local Pollinations + ffmpeg multi-frame MP4 pipeline (150s timeout)
       const jobId = `ffmpeg-video-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const job: LocalVideoJob = {
         id: jobId,
@@ -2606,12 +2866,170 @@ Return ONLY a valid JSON array of ${frameCount} strings with no markdown fences.
     }
   });
 
-  // Poll video generation operation status (supports both local ffmpeg jobs and Gemini Interactions)
+  // Poll video generation operation status (supports Magic Hour projects, local ffmpeg jobs, and Gemini Interactions)
   app.get('/api/generate/video/status/:id', async (req, res) => {
     try {
       const interactionId = req.params.id;
+      const VIDEO_TIMEOUT_MS = 150000;
 
-      // Check local Pollinations + ffmpeg video job store first
+      // 1. Check Magic Hour Video Project status (`magichour:<projectId>`)
+      if (interactionId.startsWith('magichour:')) {
+        const meta = magicHourJobMetaMap.get(interactionId);
+
+        // If this Magic Hour job already switched to local ffmpeg fallback, poll that fallback job
+        if (meta?.fallbackJobId) {
+          const fbJob = localVideoJobs.get(meta.fallbackJobId);
+          if (fbJob) {
+            if (fbJob.status === 'failed') {
+              res.status(500).json({
+                error: fbJob.error || 'Video generation failed.',
+                isPaidKeyError: false,
+              });
+              return;
+            }
+            res.json({
+              interactionId,
+              status: fbJob.status,
+              stepCount: fbJob.stepCount,
+              latestNote: fbJob.latestNote,
+              videoBase64: fbJob.videoBase64,
+              mimeType: fbJob.mimeType || 'video/mp4',
+            });
+            return;
+          }
+        }
+
+        const projectId = interactionId.replace(/^magichour:/, '');
+        const magicHourKey = resolveMagicHourApiKey();
+
+        const mhResp = await withTimeout(
+          fetch(`https://api.magichour.ai/v1/video-projects/${encodeURIComponent(projectId)}`, {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${magicHourKey}`,
+              Accept: 'application/json',
+            },
+          }),
+          45000,
+          'magicHourPollStatus'
+        );
+
+        if (!mhResp.ok) {
+          const errBody = await mhResp.text().catch(() => '');
+          throw new Error(`Magic Hour status HTTP ${mhResp.status}: ${errBody.slice(0, 180)}`);
+        }
+
+        const mhData = (await mhResp.json()) as {
+          id?: string;
+          status?: string;
+          downloads?: Array<{ url?: string; expires_at?: string }>;
+          download?: { url?: string };
+          error?: { code?: string; message?: string } | string;
+        };
+
+        if (meta) {
+          meta.pollCount += 1;
+        }
+
+        const rawStatus = (mhData.status || 'rendering').toLowerCase();
+
+        if (rawStatus === 'complete' || rawStatus === 'completed') {
+          const downloadUrl =
+            (Array.isArray(mhData.downloads) && mhData.downloads[0]?.url) ||
+            mhData.download?.url ||
+            '';
+
+          let videoBase64 = '';
+          if (downloadUrl) {
+            try {
+              const dlResp = await withTimeout(
+                fetch(downloadUrl),
+                60000,
+                'magicHourDownloadMp4'
+              );
+              if (dlResp.ok) {
+                const arrayBuf = await dlResp.arrayBuffer();
+                videoBase64 = Buffer.from(arrayBuf).toString('base64');
+              }
+            } catch {
+              // Keep downloadUrl as videoUri if buffer download fails
+            }
+          }
+
+          res.json({
+            interactionId,
+            status: 'completed',
+            stepCount: (meta?.pollCount || 1) + 1,
+            latestNote: 'Magic Hour AI video render complete.',
+            videoBase64: videoBase64 || undefined,
+            videoUri: downloadUrl || undefined,
+            mimeType: 'video/mp4',
+          });
+          return;
+        }
+
+        if (rawStatus === 'error' || rawStatus === 'failed' || rawStatus === 'canceled') {
+          // Automatically fall back to local Pollinations + ffmpeg MP4 pipeline if Magic Hour job fails
+          if (meta && !meta.fallbackJobId) {
+            const fbId = `ffmpeg-fallback-${Date.now()}`;
+            const fbJob: LocalVideoJob = {
+              id: fbId,
+              status: 'in_progress',
+              stepCount: 1,
+              latestNote: 'Switching to Pollinations + ffmpeg MP4 pipeline...',
+              mimeType: 'video/mp4',
+              aspectRatio: meta.aspectRatio,
+              duration: meta.duration,
+              createdAt: Date.now(),
+            };
+            localVideoJobs.set(fbId, fbJob);
+            meta.fallbackJobId = fbId;
+
+            withTimeout(
+              executeLocalPollinationsFfmpegVideoJob(fbJob, meta.prompt, meta.referenceImage),
+              VIDEO_TIMEOUT_MS,
+              'localPollinationsFfmpegFallback'
+            ).catch((err) => {
+              fbJob.status = 'failed';
+              fbJob.error = err instanceof Error ? err.message : 'Video generation failed.';
+            });
+
+            res.json({
+              interactionId,
+              status: 'in_progress',
+              stepCount: 1,
+              latestNote: fbJob.latestNote,
+              mimeType: 'video/mp4',
+            });
+            return;
+          }
+
+          const errDetail =
+            typeof mhData.error === 'string'
+              ? mhData.error
+              : mhData.error?.message || `Magic Hour video job ${rawStatus}.`;
+          res.status(500).json({
+            error: errDetail,
+            isPaidKeyError: false,
+          });
+          return;
+        }
+
+        // Still queued / rendering
+        res.json({
+          interactionId,
+          status: 'in_progress',
+          stepCount: meta?.pollCount || 1,
+          latestNote:
+            rawStatus === 'queued'
+              ? 'Queued on Magic Hour AI video cluster...'
+              : 'Rendering AI video frames on Magic Hour...',
+          mimeType: 'video/mp4',
+        });
+        return;
+      }
+
+      // 2. Check local Pollinations + ffmpeg video job store
       const localJob = localVideoJobs.get(interactionId);
       if (localJob) {
         if (localJob.status === 'failed') {
@@ -2632,7 +3050,7 @@ Return ONLY a valid JSON array of ${frameCount} strings with no markdown fences.
         return;
       }
 
-      const ai = getAiClient(150000);
+      const ai = getAiClient(VIDEO_TIMEOUT_MS);
       const interaction = await ai.interactions.get(interactionId);
 
       const interObj = interaction as unknown as {

@@ -10,6 +10,7 @@ import 'dotenv/config';
 const CUSTOM_GROQ_API_KEY: string = 'YOUR_GROQ_API_KEY_HERE';
 const CUSTOM_POLLINATIONS_API_KEY: string = 'YOUR_POLLINATIONS_API_KEY_HERE';
 const CUSTOM_HF_TOKEN: string = 'YOUR_HF_TOKEN_HERE';
+const CUSTOM_MAGIC_HOUR_API_KEY: string = 'YOUR_MAGIC_HOUR_API_KEY_HERE';
 const CUSTOM_GEMINI_API_KEY: string = 'YOUR_GEMINI_API_KEY_HERE';
 
 export const CONFIGURED_GROQ_API_KEY: string = (
@@ -28,6 +29,12 @@ export const CONFIGURED_HF_TOKEN: string = (
   CUSTOM_HF_TOKEN !== 'YOUR_HF_TOKEN_HERE'
     ? CUSTOM_HF_TOKEN
     : process.env.HF_TOKEN || ''
+).trim();
+
+export const CONFIGURED_MAGIC_HOUR_API_KEY: string = (
+  CUSTOM_MAGIC_HOUR_API_KEY !== 'YOUR_MAGIC_HOUR_API_KEY_HERE'
+    ? CUSTOM_MAGIC_HOUR_API_KEY
+    : process.env.MAGIC_HOUR_API_KEY || ''
 ).trim();
 
 export const GEMINI_CONFIGURED_API_KEY: string = (
